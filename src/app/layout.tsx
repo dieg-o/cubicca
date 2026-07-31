@@ -2,8 +2,10 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
+// shadcn mapea `--font-sans` en @theme inline (globals.css): la fuente tiene
+// que exponerse con ese nombre o `font-sans` queda sin resolver.
 const geistSans = Geist({
-  variable: "--font-geist-sans",
+  variable: "--font-sans",
   subsets: ["latin"],
 });
 
