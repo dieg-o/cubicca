@@ -23,6 +23,7 @@ model Organization {
   updatedAt DateTime @updatedAt @map("updated_at")
 
   profiles Profile[]
+  projects Project[]
 
   @@map("organizations")
 }
@@ -45,4 +46,21 @@ model Profile {
 
   @@index([organizationId])
   @@map("profiles")
+}
+
+// Primer modelo tenant-scoped. Todo modelo con `organizationId` DEBE estar
+// listado en TENANT_SCOPED_MODELS (src/lib/db/tenant.ts): si no está, sus
+// queries no quedan aisladas. Ver el test scripts/test-tenant-isolation.ts.
+model Project {
+  id String @id @default(uuid()) @db.Uuid
+
+  organizationId String       @map("organization_id") @db.Uuid
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([organizationId])
+  @@map("projects")
 }

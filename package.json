@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "db:smoke": "tsx scripts/smoke-db.ts",
+    "db:test-isolation": "tsx scripts/test-tenant-isolation.ts",
     "postinstall": "prisma generate"
   },
   "dependencies": {
