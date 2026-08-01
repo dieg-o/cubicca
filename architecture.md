@@ -5,7 +5,8 @@ Bitácora de decisiones y estado por tarjeta técnica (TD).
 ## Estado
 
 **TD-001 -> HECHO**: bootstrap CORE + primera migración + smoke pooler 6543 + `.env.example`.
-**TD-002 -> EN CURSO**: `getTenantPrisma` hecho y verificado; falta auth + onboarding.
+**TD-002 -> HECHO**: `getTenantPrisma` + tests de aislamiento, auth con Supabase,
+proxy, gate de profile y onboarding.
 
 ## TD-001 — Bootstrap CORE
 
@@ -129,9 +130,82 @@ sumarlo a `TENANT_SCOPED_MODELS`, copiarle el bloque de tipos del delegate
 modelo tenant-scoped que no esté en la lista queda sin aislar y sus filas se ven
 cruzadas entre organizaciones.
 
-### Pendiente de TD-002
+## TD-002 (2da mitad) — Auth, sesión y onboarding
 
-Auth propiamente dicha: cliente de Supabase (browser + server), middleware de
-sesión, y el onboarding que crea `organization` + `profile` vía `getRawPrisma()`.
-Las vars `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` ya están en
-`.env.example`; la `service_role` no entra al proyecto.
+Supabase Auth con `@supabase/ssr`. La identidad vive en `auth.users`; `profiles`
+la referencia lógicamente (sin FK) y es lo que ata un usuario a una organización.
+
+### Las tres capas, y qué garantiza cada una
+
+| Capa | Archivo | Qué hace | Qué NO garantiza |
+| --- | --- | --- | --- |
+| Proxy | `src/proxy.ts` | Mira si existe la cookie de sesión y redirige | Nada: no valida firma ni expiración, no sabe si hay profile |
+| DAL | `src/lib/auth/session.ts` | `getUser()` contra Supabase + resuelve el profile | — |
+| Layout `(app)` | `src/app/(app)/layout.tsx` | Gate de conveniencia + chrome de la app | No es frontera: no re-renderiza al navegar |
+
+La frontera real es el DAL, y se lo llama en **cada página y cada server
+action**, no solo en el layout.
+
+### Decisiones
+
+- **El proxy no toca la base ni llama a Supabase.** Corre en cada request,
+  incluidos los prefetch del router: cualquier I/O ahí se paga en todas las
+  navegaciones. Solo mira si la cookie `sb-<ref>-auth-token` existe.
+- **El proxy NO redirige de `/login` a `/`.** Parece la simétrica obvia, pero
+  con una cookie presente y vencida arma un loop infinito: el proxy manda
+  `/login -> /` y la verificación real de `/` manda `/ -> /login`. Esa
+  redirección vive en la página de login, que sí puede preguntar si la sesión
+  sirve. Verificado con curl: 1 salto, termina en 200.
+- **`getUser()`, nunca `getSession()`.** El primero valida el token contra el
+  servidor de auth; el segundo se cree lo que diga la cookie. Para decidir
+  permisos, la cookie sola no alcanza.
+- **El `orgId` sale del profile, jamás del request.** `requireProfile()` es el
+  único proveedor de `organizationId`, y lo que entrega va directo a
+  `getTenantPrisma(orgId)`. Un `organizationId` que venga por body, query o
+  header no se mira nunca.
+- **El gate del layout es conveniencia, no seguridad.** Los layouts no se
+  re-renderizan al navegar entre rutas hermanas (partial rendering), y los
+  server actions son POST alcanzables sin pasar por la UI. Como `requireProfile`
+  está envuelto en `cache()` de React, repetirlo en cada página sale gratis
+  dentro de un mismo render.
+- **`/onboarding` queda fuera del grupo `(app)`.** Si viviera adentro, el gate
+  del layout la redirigiría a sí misma.
+- **El onboarding usa `$transaction`.** Crear la organización y no el profile
+  dejaría una org huérfana a la que nadie puede entrar. Va por `getRawPrisma()`:
+  es su segundo uso permitido, porque justo ahí todavía no hay orgId.
+- **Login y signup son Server Actions, no llamadas desde el browser.** Las
+  cookies de sesión solo se pueden escribir del lado del servidor: durante el
+  render de un Server Component el store es de solo lectura, y desde el cliente
+  serían manipulables.
+- **Error de login genérico.** Distinguir "no existe" de "contraseña incorrecta"
+  regala un enumerador de cuentas.
+
+### Cosas de esta versión de Next que condicionaron el código
+
+- **`middleware.ts` ahora es `proxy.ts`** (Next 16), exporta `proxy`, corre en
+  Node por defecto, y `export const runtime` ahí **tira error**.
+- **`cookies()` va antes de leer el env** en `createSupabaseServerClient()`: es
+  lo que marca la ruta como dinámica. Al revés, `next build` intenta
+  prerenderizar `/` y explota por falta de vars. Mismo criterio que la
+  instanciación diferida del cliente de Prisma.
+- **`searchParams` es una Promise**: hay que await-earla.
+- **Las `NEXT_PUBLIC_*` se inlinean en build time**, también en el bundle del
+  proxy. Cambiarlas exige rebuild; pasarlas por env al arrancar el server no
+  tiene efecto.
+
+### Límite conocido: refresh del token
+
+El proxy no refresca la sesión (es cookie-only por diseño). Supabase refresca al
+llamar `getUser()`, pero durante el render de un Server Component las cookies son
+de solo lectura, así que el token renovado **no se persiste**. Las escrituras de
+cookie que sí funcionan son las de los server actions (login, signup, logout).
+En la práctica esto significa que una sesión cuyo access token venció entre
+navegaciones puede terminar mandando al usuario a `/login` antes de tiempo.
+Si aparece, la solución es que el proxy llame a `getUser()` y escriba las
+cookies renovadas en la respuesta — a costa de una llamada de red por request.
+
+### Verificación
+
+`npm run build` verde. Ruteo probado con curl contra el build de producción:
+sin cookie, con cookie inválida y assets. `GET /api/_smoke` se eliminó: era del
+bootstrap y hoy sería una ruta sin auth que toca la base.
