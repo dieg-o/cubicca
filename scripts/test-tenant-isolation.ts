@@ -209,6 +209,146 @@ async function main(): Promise<void> {
       `quedó ${JSON.stringify(sobrevivienteB)}`
     );
 
+    console.log("\nPlanos (modelo scopeado con FK a otro modelo scopeado)");
+
+    // Proyecto nuevo para A: el deleteMany() de arriba se llevó los anteriores.
+    // El de B sobrevivió, así que sirve de anclaje para las filas ajenas.
+    const proyectoA = await raw.project.create({
+      data: { organizationId: orgA.id, name: "Proyecto de A (planos)" },
+    });
+
+    const planFields = {
+      storagePath: "seed/plan.pdf",
+      originalFilename: "plano.pdf",
+      contentType: "application/pdf",
+      fileSizeBytes: 1024,
+    };
+
+    const planA = await raw.plan.create({
+      data: { ...planFields, organizationId: orgA.id, projectId: proyectoA.id },
+    });
+    const planB = await raw.plan.create({
+      data: {
+        ...planFields,
+        organizationId: orgB.id,
+        projectId: projectB.id,
+        originalFilename: "plano-de-b.pdf",
+      },
+    });
+
+    const planesVisibles = await db.plan.findMany();
+    check(
+      "plan.findMany() sin where devuelve solo los planos de la propia org",
+      planesVisibles.length === 1 && planesVisibles[0]?.id === planA.id,
+      `devolvió ${planesVisibles.length} fila(s)`
+    );
+
+    const planAjeno = await db.plan.findUnique({ where: { id: planB.id } });
+    check(
+      "plan.findUnique() por id de otra org devuelve null",
+      planAjeno === null,
+      `devolvió ${JSON.stringify(planAjeno)}`
+    );
+
+    // El caso realista de fuga en esta feature: el call site filtra por
+    // projectId —que ES el filtro natural del detalle de proyecto— y se olvida
+    // de la org. El projectId de otra organización no puede devolver nada.
+    const porProyectoAjeno = await db.plan.findMany({ where: { projectId: projectB.id } });
+    check(
+      "plan.findMany() por un projectId de otra org no devuelve nada",
+      porProyectoAjeno.length === 0,
+      `devolvió ${porProyectoAjeno.length} fila(s)`
+    );
+
+    const planesContados = await db.plan.count();
+    check("plan.count() cuenta solo la propia org", planesContados === 1, `contó ${planesContados}`);
+
+    const planCreado = await db.plan.create({
+      data: { ...planFields, projectId: proyectoA.id },
+    });
+    check(
+      "plan.create() sin organizationId lo inyecta desde la sesión",
+      planCreado.organizationId === orgA.id,
+      `quedó en ${planCreado.organizationId}`
+    );
+
+    await db.plan.create({
+      data: { ...planFields, projectId: proyectoA.id, organizationId: orgA.id },
+    });
+
+    await checkThrows("plan.create() con el organizationId de otra org lanza error", () =>
+      db.plan.create({
+        data: { ...planFields, projectId: projectB.id, organizationId: orgB.id },
+      })
+    );
+
+    await checkThrows("plan.createMany() con una fila apuntando a otra org lanza error", () =>
+      db.plan.createMany({
+        data: [
+          { ...planFields, projectId: proyectoA.id },
+          { ...planFields, projectId: projectB.id, organizationId: orgB.id },
+        ],
+      })
+    );
+
+    const planConRelacion = {
+      data: {
+        ...planFields,
+        projectId: proyectoA.id,
+        organization: { connect: { id: orgB.id } },
+      },
+    } as unknown as { data: typeof planFields & { projectId: string } };
+
+    await checkThrows("plan.create() con `organization: { connect }` a otra org lanza error", () =>
+      db.plan.create(planConRelacion)
+    );
+
+    await checkThrows("plan.findMany() con un organizationId ajeno en el where lanza error", () =>
+      db.plan.findMany({ where: { organizationId: orgB.id } })
+    );
+
+    const planUpserted = await db.plan.upsert({
+      where: { id: planB.id },
+      create: { ...planFields, projectId: proyectoA.id },
+      update: { originalFilename: "pisado-por-a.pdf" },
+    });
+    check(
+      "plan.upsert() sobre un id de otra org crea en la propia en vez de pisar el ajeno",
+      planUpserted.organizationId === orgA.id && planUpserted.id !== planB.id,
+      `resolvió a ${planUpserted.id} (org ${planUpserted.organizationId})`
+    );
+
+    await checkThrows("plan.update() por id de otra org no encuentra la fila", () =>
+      db.plan.update({ where: { id: planB.id }, data: { status: "READY" } })
+    );
+
+    await checkThrows("plan.update() no puede mover una fila propia a otra org", () =>
+      db.plan.update({ where: { id: planA.id }, data: { organizationId: orgB.id } })
+    );
+
+    const planesTocados = await db.plan.updateMany({ data: { status: "READY" } });
+    check(
+      "plan.updateMany() sin where no alcanza filas de otra org",
+      planesTocados.count === 4,
+      `actualizó ${planesTocados.count} fila(s)`
+    );
+
+    const planesBorrados = await db.plan.deleteMany();
+    check(
+      "plan.deleteMany() sin where borra solo la propia org",
+      planesBorrados.count === 4,
+      `borró ${planesBorrados.count} fila(s)`
+    );
+
+    const planSobrevivienteB = await raw.plan.findUnique({ where: { id: planB.id } });
+    check(
+      "el plano de la otra org sigue intacto y sin tocar",
+      planSobrevivienteB !== null &&
+        planSobrevivienteB.originalFilename === "plano-de-b.pdf" &&
+        planSobrevivienteB.status === "PENDING",
+      `quedó ${JSON.stringify(planSobrevivienteB)}`
+    );
+
     console.log("\nContrato de la primitiva");
 
     await checkThrows("getTenantPrisma('') lanza error", async () => getTenantPrisma(""));
@@ -222,7 +362,7 @@ async function main(): Promise<void> {
       `devolvió ${orgs.length} organización(es)`
     );
   } finally {
-    // onDelete: Cascade se lleva los projects de ambas orgs.
+    // onDelete: Cascade se lleva los projects y los plans de ambas orgs.
     await raw.organization.deleteMany({ where: { id: { in: [orgA.id, orgB.id] } } });
     await raw.$disconnect();
   }

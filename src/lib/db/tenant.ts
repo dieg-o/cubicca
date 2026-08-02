@@ -27,7 +27,7 @@ import { prisma as basePrisma } from "@/lib/db/prisma";
  * `Organization` NO va: es el modelo raíz, se filtra por su propio `id`.
  * `Profile` tampoco: lo maneja el flujo de auth con el cliente sin scopear.
  */
-const TENANT_SCOPED_MODELS: ReadonlySet<string> = new Set(["Project"]);
+const TENANT_SCOPED_MODELS: ReadonlySet<string> = new Set(["Project", "Plan"]);
 
 /** Operaciones que filtran filas existentes: les inyectamos el `where`. */
 const WHERE_OPERATIONS: ReadonlySet<string> = new Set([
@@ -221,6 +221,7 @@ function createScopedClient(orgId: string) {
 type ScopedClient = ReturnType<typeof createScopedClient>;
 
 type ProjectDelegate = ScopedClient["project"];
+type PlanDelegate = ScopedClient["plan"];
 
 /**
  * ────────────────────────────────────────────────────────────────────────────
@@ -290,8 +291,54 @@ interface TenantProjectDelegate
   ): Prisma.Prisma__ProjectClient<Prisma.Result<ProjectDelegate, T, "upsert">>;
 }
 
-export type TenantPrisma = Omit<ScopedClient, "project"> & {
+/** Mismo bloque que Project, copiado tal cual para Plan (ver el comentario de arriba). */
+
+type PlanCreateInput = Omit<Prisma.PlanUncheckedCreateInput, "organizationId"> & {
+  organizationId?: string;
+};
+
+type PlanCreateManyInput = Omit<Prisma.PlanCreateManyInput, "organizationId"> & {
+  organizationId?: string;
+};
+
+type PlanCreateArgs = Omit<Prisma.PlanCreateArgs, "data"> & {
+  data: PlanCreateInput;
+};
+
+type PlanCreateManyArgs = Omit<Prisma.PlanCreateManyArgs, "data"> & {
+  data: PlanCreateManyInput | PlanCreateManyInput[];
+};
+
+type PlanCreateManyAndReturnArgs = Omit<Prisma.PlanCreateManyAndReturnArgs, "data"> & {
+  data: PlanCreateManyInput | PlanCreateManyInput[];
+};
+
+type PlanUpsertArgs = Omit<Prisma.PlanUpsertArgs, "create"> & {
+  create: PlanCreateInput;
+};
+
+interface TenantPlanDelegate
+  extends Omit<PlanDelegate, "create" | "createMany" | "createManyAndReturn" | "upsert"> {
+  create<T extends PlanCreateArgs>(
+    args: Prisma.SelectSubset<T, PlanCreateArgs>
+  ): Prisma.Prisma__PlanClient<Prisma.Result<PlanDelegate, T, "create">>;
+
+  createMany<T extends PlanCreateManyArgs>(
+    args: Prisma.SelectSubset<T, PlanCreateManyArgs>
+  ): Prisma.PrismaPromise<Prisma.BatchPayload>;
+
+  createManyAndReturn<T extends PlanCreateManyAndReturnArgs>(
+    args: Prisma.SelectSubset<T, PlanCreateManyAndReturnArgs>
+  ): Prisma.PrismaPromise<Prisma.Result<PlanDelegate, T, "createManyAndReturn">>;
+
+  upsert<T extends PlanUpsertArgs>(
+    args: Prisma.SelectSubset<T, PlanUpsertArgs>
+  ): Prisma.Prisma__PlanClient<Prisma.Result<PlanDelegate, T, "upsert">>;
+}
+
+export type TenantPrisma = Omit<ScopedClient, "project" | "plan"> & {
   project: TenantProjectDelegate;
+  plan: TenantPlanDelegate;
 };
 
 /**

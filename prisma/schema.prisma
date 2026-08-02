@@ -15,6 +15,14 @@ enum Role {
   MEMBER
 }
 
+/// Ciclo de vida de un plano. PENDING = la fila existe y hay una signed upload
+/// URL emitida, pero los bytes todavía no están confirmados en Storage. READY =
+/// el objeto existe (verificado server-side) y el diagnóstico está persistido.
+enum PlanStatus {
+  PENDING
+  READY
+}
+
 model Organization {
   id        String   @id @default(uuid()) @db.Uuid
   name      String
@@ -24,6 +32,7 @@ model Organization {
 
   profiles Profile[]
   projects Project[]
+  plans    Plan[]
 
   @@map("organizations")
 }
@@ -57,10 +66,53 @@ model Project {
   organizationId String       @map("organization_id") @db.Uuid
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
 
-  name      String
+  name String
+
+  /// Altura de escantillón por defecto (metros) para el cómputo de muros del
+  /// proyecto. Se define al crearlo y cada plano lo hereda cuando haga falta.
+  escantillonDefault Float @default(2.4) @map("escantillon_default")
+
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
+  plans Plan[]
+
   @@index([organizationId])
   @@map("projects")
+}
+
+/// Un PDF de plano subido a un proyecto.
+///
+/// Los bytes NO viven acá ni pasan nunca por el server: van directo del browser
+/// a Supabase Storage (bucket privado `plans`) vía signed upload URL. Esta fila
+/// guarda el puntero al objeto (`storagePath`) y el diagnóstico vector/raster.
+model Plan {
+  id String @id @default(uuid()) @db.Uuid
+
+  organizationId String       @map("organization_id") @db.Uuid
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  projectId String  @map("project_id") @db.Uuid
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// Clave del objeto en el bucket: '{orgId}/{projectId}/{planId}.pdf'. Lleva el
+  /// orgId adelante para que un listado por prefijo ya quede acotado al tenant.
+  storagePath      String @map("storage_path")
+  originalFilename String @map("original_filename")
+  contentType      String @map("content_type")
+  fileSizeBytes    Int    @map("file_size_bytes")
+
+  /// Metadata del diagnóstico. Nullable porque un plan PENDING todavía no la
+  /// tiene: se completa recién en finalizePlanUpload.
+  pageCount         Int?     @map("page_count")
+  hasVectorGeometry Boolean? @map("has_vector_geometry")
+  diagnosisJson     Json?    @map("diagnosis_json")
+
+  status    PlanStatus @default(PENDING)
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
+
+  @@index([organizationId])
+  @@index([projectId])
+  @@map("plans")
 }

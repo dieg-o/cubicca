@@ -16,6 +16,9 @@ clasifica como `AuthError`. Cookie-only asumido para el MVP.
 **TD-002-FIX-4**: **confirmación de email APAGADA para el MVP** (toggle del
 dashboard). `signUp()` devuelve sesión directa y el alta va derecho a
 `/onboarding`. `/auth/confirm` y `/auth/callback` quedan en el repo, dormidas.
+**TD-003 -> HECHO**: proyectos (CRUD mínimo), upload de PDF directo a Storage,
+viewer con pdf.js y diagnóstico vector/raster persistido.
+**Próximo: TD-004** (calibración: `scaleFactor` / `unit` en `plans`).
 
 ## TD-001 — Bootstrap CORE
 
@@ -358,3 +361,175 @@ hosting y la URL dada de alta en Redirect URLs del dashboard.
 
 El E2E que sí aplica hoy es el del alta directa: signup con email fresco →
 sesión inmediata → `/onboarding` → crear organización → home.
+
+## TD-003 — Proyectos, upload de planos, viewer y diagnóstico vector/raster
+
+Primer flujo de producto: crear un proyecto, subirle un PDF de plano, verlo, y
+decidir si ese PDF está **dibujado** (vectorial) o **escaneado** (raster). Ese
+veredicto es la precondición de la auto-detección de muros: sobre un escaneo no
+hay geometría que leer.
+
+Fuera de alcance a propósito: medición y calibración (TD-004/005). El viewer es
+render + navegación + zoom, sin una sola herramienta de dibujo.
+
+### Storage: bytes por afuera del server
+
+**Decisión: los bytes NUNCA pasan por el lambda.** El límite de body de una
+Server Action / función de Vercel ronda los 4,5 MB y un plano de obra lo pasa
+sin esfuerzo. El archivo va **directo del browser a Supabase Storage**; el
+servidor solo autoriza antes y confirma después.
+
+| Momento | Quién | Qué hace |
+| --- | --- | --- |
+| Autorizar | `requestPlanUpload` (server action) | Valida sesión + org + proyecto + MIME + tamaño, crea la fila `plans` en `PENDING` y mintea una **signed upload URL** |
+| Subir | Browser | `PUT` del `File` a esa URL, con barra de progreso |
+| Diagnosticar | Browser | pdf.js sobre el `File` que ya está en memoria |
+| Confirmar | `finalizePlanUpload` (server action) | Verifica el objeto **contra Storage**, recalcula el veredicto y pasa el plan a `READY` |
+| Re-visitar | `GET /api/plans/[planId]/file` | Mintea una **signed download URL** de 5 minutos |
+
+**Decisión: tenancy en la app, no en RLS de Storage.** El bucket `plans` es
+privado y no tiene políticas: la autorización vive en el código. Toda operación
+de Storage se firma **recién después** de haber probado, vía
+`getTenantPrisma(orgId)`, que la fila es de la organización de la sesión. Es la
+misma frontera que ya usa todo lo demás, en vez de una segunda frontera en otro
+lenguaje que haya que mantener sincronizada.
+
+- **La `storagePath` la arma el servidor, nunca el cliente**:
+  `{orgId}/{projectId}/{planId}.pdf`. El orgId adelante no es cosmético: deja la
+  clave particionada por tenant desde el día uno, por si algún día se suman
+  políticas de Storage.
+- **El bucket topea lo mismo que el código**: privado, `application/pdf`,
+  50 MB. El límite se repite en tres lugares (input del browser, server action,
+  bucket) y los tres tienen que decir lo mismo — el que manda es el bucket,
+  porque es el único que el cliente no puede saltear.
+- **`SUPABASE_SERVICE_ROLE_KEY` vive en un solo módulo**,
+  `src/lib/supabase/admin.ts`, que arranca con `import "server-only"`: si algún
+  día un client component lo importa —directo o por una cadena de imports— el
+  build **falla** en vez de mandar la llave al browser. Sin prefijo
+  `NEXT_PUBLIC_` (esas se inlinean en el bundle del cliente), sin loguearse y
+  sin volver en ninguna respuesta: lo único que sale son URLs firmadas.
+- **`PENDING` no es decoración.** Es el estado real entre "se firmó la URL" y
+  "el objeto está confirmado". Si el usuario cierra la pestaña en el medio, la
+  fila queda en `PENDING` y el viewer no la ofrece. Pasó de verdad durante la
+  verificación de esta TD y se comportó como corresponde.
+- **XHR en vez de `uploadToSignedUrl()` del SDK.** El SDK usa `fetch`, que no
+  reporta progreso de subida; para 40 MB eso es una pantalla congelada. El
+  destino es exactamente el mismo endpoint (`src/lib/plans/upload.ts`).
+- **La ruta de lectura es un Route Handler, no un action.** No muta nada, y los
+  Server Actions se despachan de a uno por cliente: una lectura no tiene por qué
+  hacer cola detrás de una mutación. Devuelve la URL firmada con
+  `Cache-Control: no-store` — es una credencial de vida corta.
+
+### Modelo de datos
+
+`projects.escantillonDefault` (metros, default 2.4) y la tabla `plans`:
+puntero al objeto (`storagePath`, `originalFilename`, `contentType`,
+`fileSizeBytes`), resultado del diagnóstico (`pageCount`, `hasVectorGeometry`,
+`diagnosisJson`) y `status` (`PENDING` | `READY`). `organizationId` y
+`projectId` con FK e índice; el segundo con `onDelete: Cascade`.
+
+`Plan` es tenant-scoped: está en `TENANT_SCOPED_MODELS`, tiene su bloque de
+tipos en `tenant.ts` (el `organizationId` opcional en los creates) y sus casos
+en `scripts/test-tenant-isolation.ts` — las tres cosas que pide la primitiva.
+El caso de fuga propio de esta feature está cubierto explícitamente: filtrar
+`plan.findMany({ where: { projectId } })` con el `projectId` de otra
+organización **no devuelve nada**, porque el filtro natural del detalle de
+proyecto es justamente el que invita a olvidarse de la org.
+
+La calibración (`scaleFactor` / `unit`) queda **diferida a TD-004**.
+
+### Diagnóstico vector/raster
+
+Corre **en el browser** (pdf.js necesita un DOM y ya tiene el archivo en
+memoria) y no renderiza nada: cuenta operadores con `getOperatorList()`.
+
+**Decisión: el cliente CUENTA, el servidor DECIDE.** El payload que viaja son
+conteos crudos por página; el veredicto lo calcula `diagnosePlan()`
+(`src/lib/plans/diagnosis.ts`), una función pura que el server vuelve a aplicar
+sobre esos números. Así lo guardado nunca puede contradecir a sus propios
+conteos, y mover un umbral mañana es recalcular sobre lo ya persistido. Si el
+veredicto del cliente difiere del recalculado, se loguea como drift entre las
+dos puntas (deploy a medio camino, bundle viejo en caché) y manda el servidor.
+
+Qué se cuenta por página: segmentos de path, operaciones de pintado, de imagen,
+de texto, y **cuánto de la página tapa la imagen más grande**.
+
+- **⚠️ En pdf.js v6 no existen `moveTo` / `lineTo` / `rectangle` sueltos.** El
+  worker los comprime en un único `constructPath` cuyos args traen los segmentos
+  codificados en un `Float32Array`. Contar `fnArray` a secas daría "12 paths"
+  donde hay 9.400 segmentos, que es justo el dato que decide todo. Los códigos
+  de `DrawOPS` son internos y **no están exportados**: van escritos a mano en
+  `diagnose.ts`, y el recorrido corta ante un código desconocido (conteo corto,
+  nunca inventado). Revisar esa tabla al subir de major.
+- **La cobertura de imagen se calcula con un solo número.** pdf.js dibuja toda
+  imagen sobre el cuadrado unitario de la transformación corriente, así que el
+  área cubierta es `|det(CTM)|`; y como `det(A·B) = det(A)·det(B)`, no hace
+  falta llevar la matriz entera: alcanza con el determinante y su pila de
+  `save`/`restore`. Ignora clips y grupos de transparencia, así que
+  **sobreestima** la cobertura — el error empuja hacia "raster", que es el lado
+  conservador: un falso "vectorial" mandaría la auto-detección a buscar
+  geometría que no existe.
+- **La heurística tiene dos umbrales, no uno.** Página vectorial = al menos 40
+  segmentos de path **y** que no esté dominada por una imagen a página completa
+  (≥60% del área). Lo segundo importa tanto como lo primero: un plano escaneado
+  con cajetín y marco vectoriales pasa los 40 segmentos sin tener una sola pared
+  que detectar. Para ganarle a una imagen a página completa hacen falta 200
+  segmentos. Documento vectorial = **alguna** página lo es (un PDF de 12 hojas
+  donde solo la planta baja está dibujada igual sirve, en esa hoja).
+- **Tope de 30 páginas analizadas.** El conteo es O(operadores) y corre en la
+  pestaña del usuario. `pageCount` sigue siendo el real y la UI aclara cuántas
+  se miraron.
+- **`diagnosisJson` se relee con Zod.** La columna es `Json`: lo que hay adentro
+  lo escribió una versión anterior del código. Si no valida, el plano se muestra
+  sin desglose en vez de romper la página.
+
+### pdf.js bajo Next 16 / Turbopack
+
+- **Build LEGACY, no el moderno.** No es conservadurismo: el build moderno de
+  pdf.js v6 llama a `Map.prototype.getOrInsertComputed` (propuesta reciente de
+  TC39), y en un Chromium sin ese método `getOperatorList()` explota con
+  `this._intentStates.getOrInsertComputed is not a function`. Verificado en
+  Chromium headless durante esta TD, no es teoría: el primer E2E falló
+  exactamente ahí. El build legacy trae el polyfill adentro. Se paga un bundle
+  algo más grande; la alternativa era que el diagnóstico no corra en la máquina
+  de un cliente.
+- **El worker se sirve desde `/public`.** `scripts/copy-pdf-worker.mjs` lo copia
+  en cada `npm install` (postinstall) desde la versión instalada, y está en
+  `.gitignore`: commitearlo es la forma segura de que se desincronice de la
+  librería, y pdf.js aborta si las versiones difieren. La alternativa —dejar que
+  el bundler resuelva `new URL(<paquete>, import.meta.url)`— depende de que
+  Turbopack entienda esa forma con un specifier de paquete, y un fallo ahí
+  aparece recién en runtime como "Setting up fake worker failed".
+- **El import de pdf.js es dinámico.** Los client components también se
+  renderizan en el servidor, y pdf.js toca `document` y `Worker` al evaluarse.
+- **El viewer se remonta con `key`, no se resetea con efectos.** Cambiar de
+  plano tiene que reabrir el documento desde cero; escribir estado
+  sincrónicamente en el cuerpo de un efecto además dispara renders en cascada
+  (y el lint de React 19 lo marca como error).
+- **El canvas se dibuja a resolución de dispositivo** (topeada en 2×) y se
+  muestra a tamaño CSS: sin eso, las líneas finas de un plano salen borrosas en
+  una pantalla retina.
+
+### Verificación
+
+- `npm run db:test-isolation` en verde, ahora con **14 casos nuevos de `plans`**
+  (lecturas cruzadas, `where` olvidado, create sin org, create/createMany/upsert
+  hacia otra org, update que intenta mover la fila, deletes).
+- E2E real con Chromium headless contra el dev server: signup → onboarding →
+  crear proyecto → subir PDF → badge → viewer (render, zoom, navegación) →
+  re-visita por URL firmada → rechazo de un no-PDF. Sin errores de consola.
+  Confirmado en el Network que el `PUT` de los bytes va a
+  `supabase.co/storage/v1/...` y **no** al server de la app.
+- Cuatro PDFs de prueba construidos a mano para cubrir los cuatro cuadrantes de
+  la heurística: vectorial puro, imagen a página completa, escaneo con cajetín
+  vectorial (la trampa) y vectorial con logo chico. Los cuatro veredictos
+  salieron como corresponde, en el browser y persistidos en la base.
+- `next build`, `tsc --noEmit` y `eslint` limpios. Verificado por grep sobre
+  `.next/static` que **ni la service_role key ni su nombre** aparecen en el
+  bundle del cliente (control positivo: un string de la UI sí aparece, así que
+  el grep mira donde tiene que mirar).
+
+**Pendiente para Diego**: no hay planos reales en la máquina, así que el
+veredicto sobre PDFs de obra de verdad —el dato que decide el enfoque de la
+auto-detección de muros— todavía no se puede reportar. Subir dos o tres planos
+reales y mirar el desglose por página.

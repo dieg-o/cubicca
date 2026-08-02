@@ -47,3 +47,7 @@ next-env.d.ts
 
 # prisma generated client
 /src/generated/prisma
+
+# worker de pdf.js: lo copia scripts/copy-pdf-worker.mjs en cada npm install,
+# desde la versión instalada. Commitearlo es pedir que se desincronice.
+/public/pdf.worker.min.mjs

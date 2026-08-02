@@ -3,7 +3,10 @@
  *
  * Son `NEXT_PUBLIC_` a propósito: viajan al browser y son seguras de exponer.
  * La anon key no da acceso a nada por sí sola — la autorización real la imponen
- * la sesión y (cuando exista) RLS. La `service_role` NO entra a este proyecto.
+ * la sesión y (cuando exista) RLS.
+ *
+ * ⚠️ La `service_role` NO pasa por acá y NUNCA lleva prefijo NEXT_PUBLIC_: vive
+ * en `src/lib/supabase/admin.ts`, detrás de `import "server-only"`.
  *
  * ⚠️ No se puede desestructurar `process.env` ni leerlo con una clave dinámica:
  * Next reemplaza `process.env.NEXT_PUBLIC_*` textualmente en el bundle del
