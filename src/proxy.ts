@@ -28,16 +28,27 @@ import type { NextRequest } from "next/server";
 /** Único lugar donde se puede canjear un `code` de PKCE por una sesión. */
 const AUTH_CALLBACK_PATH = "/auth/callback";
 
+/** Donde se verifica el `token_hash` del mail de confirmación. */
+const AUTH_CONFIRM_PATH = "/auth/confirm";
+
 /**
  * Rutas que se ven sin sesión. Todo lo demás requiere estar logueado.
  *
- * `/auth/callback` está acá por obligación, no por comodidad: es donde se canjea
- * el `code` del mail de confirmación por una sesión, así que por definición
- * llega SIN sesión. Mandarlo a `/login` dejaría el code sin canjear y el signup
- * nunca terminaría. Sigue dentro del matcher —el proxy corre— pero no se
- * redirige.
+ * Las dos de `/auth/*` están acá por obligación, no por comodidad: son los dos
+ * puntos donde se ESTABLECE una sesión, así que por definición se llega a ellas
+ * SIN sesión. Mandarlas a `/login` dejaría el token sin verificar y el alta
+ * nunca terminaría. Siguen dentro del matcher —el proxy corre— pero no se
+ * redirigen.
+ *
+ * - `/auth/confirm`: verifica el `token_hash` del mail (el camino del alta).
+ * - `/auth/callback`: canjea el `code` de PKCE (queda para OAuth y magic links).
  */
-const PUBLIC_PATHS: ReadonlySet<string> = new Set(["/login", "/signup", AUTH_CALLBACK_PATH]);
+const PUBLIC_PATHS: ReadonlySet<string> = new Set([
+  "/login",
+  "/signup",
+  AUTH_CALLBACK_PATH,
+  AUTH_CONFIRM_PATH,
+]);
 
 /**
  * Nombre de la cookie de sesión de Supabase: `sb-<project-ref>-auth-token`,

@@ -8,7 +8,11 @@ Bitácora de decisiones y estado por tarjeta técnica (TD).
 **TD-002 -> HECHO**: `getTenantPrisma` + tests de aislamiento, auth con Supabase,
 proxy, gate de profile y onboarding.
 **TD-002-FIX**: callback PKCE de confirmación de email (`/auth/callback`) +
-`emailRedirectTo`. Código listo, falta la prueba end-to-end.
+`emailRedirectTo`. Superado por FIX-3 para el mail; la ruta queda para OAuth.
+**TD-002-FIX-2**: `getUser()` degrada a "deslogueado" ante throws que auth-js no
+clasifica como `AuthError`. Cookie-only asumido para el MVP.
+**TD-002-FIX-3**: confirmación de email por `token_hash` + `verifyOtp`
+(`/auth/confirm`). Destraba el E2E desde cualquier dispositivo.
 
 ## TD-001 — Bootstrap CORE
 
@@ -182,55 +186,76 @@ action**, no solo en el layout.
 - **Error de login genérico.** Distinguir "no existe" de "contraseña incorrecta"
   regala un enumerador de cuentas.
 
-### Confirmación de email: el flujo PKCE
+### Confirmación de email: `token_hash` + `verifyOtp`
 
-`@supabase/ssr` crea los clientes con `flowType: "pkce"` y eso no es opcional: lo
-fija la librería. La consecuencia es que **el link del mail no trae una sesión**,
-trae un `code` de un solo uso que hay que canjear contra el servidor de auth
-junto con el *code verifier* que quedó en una cookie al hacer el signUp. Sin un
-lugar donde canjearlo, el signup nunca termina.
+El mail de alta **no va por PKCE**. Va por `token_hash`: el link trae un hash de
+un solo uso que se verifica con `verifyOtp()`, sin depender de ninguna cookie
+previa.
+
+**Por qué se cambió.** El primer intento fue PKCE (`/auth/callback` +
+`exchangeCodeForSession`). Ese canje necesita el *code verifier* que quedó en una
+cookie al hacer el signUp, así que **solo funciona en el mismo browser donde se
+hizo el alta**. Abrir el mail en el teléfono —el caso normal— deja el canje sin
+verifier y la confirmación falla. La evidencia en prod: el `/verify` de Supabase
+respondía **303** y redirigía bien, pero el canje moría después por falta de
+`code_verifier`. No es un bug del código: es el modelo de PKCE, que asume un
+único agente de usuario de punta a punta.
+
+`verifyOtp()` no tiene esa restricción. El `token_hash` se valida solo contra el
+servidor de auth, **desde cualquier browser o dispositivo**.
 
 El flujo completo, y qué pieza sostiene cada tramo:
 
 | Paso | Dónde | Qué pasa |
 | --- | --- | --- |
-| 1. signUp | `src/app/(auth)/actions.ts` | Manda `emailRedirectTo` y deja el code verifier en una cookie |
-| 2. click en el mail | — | Supabase redirige a `<origin>/auth/callback?code=…` |
-| 3. el proxy deja pasar | `src/proxy.ts` | `/auth/callback` está en `PUBLIC_PATHS` |
-| 4. canje | `src/app/auth/callback/route.ts` | `exchangeCodeForSession()` escribe las cookies de sesión |
-| 5. destino | idem | Redirige a `safeNextPath(next)`; el gate real deriva a `/onboarding` si falta org |
+| 1. signUp | `src/app/(auth)/actions.ts` | Crea el usuario; manda `emailRedirectTo` |
+| 2. el mail | Template del dashboard | `{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=email` |
+| 3. el proxy deja pasar | `src/proxy.ts` | `/auth/confirm` está en `PUBLIC_PATHS` |
+| 4. verificación | `src/app/auth/confirm/route.ts` | `verifyOtp({ token_hash, type })` escribe las cookies de sesión |
+| 5. destino | idem | `/onboarding` por defecto, o `safeNextPath(next)` si vino `next` |
 
-- **El callback es un Route Handler, no una página.** El canje **escribe**
-  cookies, y durante el render de un Server Component el store de cookies es de
-  solo lectura — el mismo motivo por el que login y signup son server actions.
-  En un Route Handler `cookies().set()` sí funciona, así que
-  `createSupabaseServerClient()` sirve tal cual está.
-- **`/auth/callback` va en `PUBLIC_PATHS` por obligación, no por comodidad.**
-  Quien llega ahí todavía NO tiene sesión: esa es la razón de existir de la ruta.
-  Si el proxy la mandara a `/login`, el code quedaría sin canjear. Sigue dentro
-  del matcher —el proxy corre— pero no se redirige.
-- **`emailRedirectTo` se resuelve en el server action.** Sin ese parámetro
-  Supabase usa el Site URL del dashboard —la raíz— y el code aterriza en una
-  página que no sabe canjearlo. Manda `NEXT_PUBLIC_SITE_URL` si está (en prod el
-  dominio es fijo y no conviene depender de un header); si no, se usa el `Origin`
-  del request, que en un Server Action Next ya valida contra el Host.
+- **El link lo arma el template del dashboard, no el código**
+  (Authentication → Email Templates). De ahí que el **orden de deploy** importe:
+  primero tiene que existir `/auth/confirm` en producción, recién después se
+  cambia el template. Al revés, los links nuevos apuntan a una ruta inexistente
+  y dan 404.
+- **El `type` se pasa tal cual viene en la query, sin lista blanca.** Si Supabase
+  rechazara `email` y hubiera que mandar `signup`, el ajuste es editar el
+  template y nada más — sin recompilar ni redeployar. `EmailOtpType` acepta
+  cualquier string por diseño y quien valida de verdad es el servidor de auth.
+- **Es un Route Handler, no una página.** `verifyOtp` **escribe** cookies, y
+  durante el render de un Server Component el store es de solo lectura — el mismo
+  motivo por el que login y signup son server actions.
+- **`/auth/confirm` va en `PUBLIC_PATHS` por obligación.** Quien llega ahí
+  todavía NO tiene sesión: esa es la razón de existir de la ruta.
+- **Re-clic de un link ya usado → mensaje amable, nunca 500.** `verifyOtp`
+  devuelve error y el route redirige a `/login?error=used`, que se pinta como
+  `notice` gris y no como error rojo. No se puede distinguir "ya usado" de
+  "vencido" —Supabase devuelve lo mismo para los dos, a propósito— así que el
+  texto cubre ambos y empuja a la acción útil: iniciar sesión.
+- **Las fallas técnicas van a `/login?error=auth`**: link sin `token_hash` o sin
+  `type`, y excepciones inesperadas. El motivo real queda en el log del servidor.
+
+#### Lo que queda de PKCE, y por qué
+
+`/auth/callback` + `exchangeCodeForSession` **siguen vivos**. No son código
+muerto: OAuth y los magic links los van a necesitar, y ahí el flujo sí empieza y
+termina en el mismo browser, que es la condición que PKCE requiere.
+
+- **`emailRedirectTo` se sigue resolviendo en el server action** desde
+  `NEXT_PUBLIC_SITE_URL`, con fallback al `Origin` del request.
   ⚠️ La URL tiene que estar cargada en **Authentication → URL Configuration →
-  Redirect URLs** del dashboard de Supabase, o el canje se rechaza. Y al ser una
+  Redirect URLs** del dashboard, o el redirect se rechaza. Y al ser una
   `NEXT_PUBLIC_*` se inlinea en build time: cambiarla en el hosting exige
   redeploy, no alcanza con reiniciar (ver la sección de Next más abajo).
-- **Red de contención para el `code` huérfano.** Si el Site URL del dashboard
-  apunta a la raíz, o si un mail viejo sigue apuntando ahí, el code cae en `/`.
-  El proxy lo detecta (`!hasSession && pathname === "/" && searchParams.has("code")`)
-  y lo reenvía al callback con la query intacta. El `!hasSession` no es un
-  detalle: con sesión, `/` renderiza bien y un code sobrante se ignora; mandarlo
-  igual al callback sería un rebote de más por un code que casi seguro ya se usó.
-- **Todos los errores del canje terminan en `/login?error=auth`.** El motivo real
-  va al log del servidor; al usuario se le da un mensaje accionable y nada más.
-  El caso más común no es un ataque: el usuario abrió el mail en otro browser o
-  dispositivo, así que la cookie con el code verifier no está.
-- **`safeNextPath()` se mudó a `src/lib/auth/redirects.ts`.** Lo usan los dos
-  lados del flujo —los server actions y el callback— y en ambos un `//evil.com`
-  o un `https://…` sin sanear serían un open redirect.
+- **La red de contención del `code` huérfano se queda.** El proxy detecta
+  `!hasSession && pathname === "/" && searchParams.has("code")` y reenvía al
+  callback con la query intacta. Ojo: los mails viejos que ya salieron con
+  `?code=` **van a seguir fallando** — es el bug que dejamos atrás, no algo que
+  el net arregle. Se mantiene porque no molesta y cubre el caso OAuth futuro.
+- **`safeNextPath()` vive en `src/lib/auth/redirects.ts`.** Lo usan los tres
+  lados —server actions, `/auth/callback` y `/auth/confirm`— y en todos un
+  `//evil.com` o un `https://…` sin sanear serían un open redirect.
 
 ### Cosas de esta versión de Next que condicionaron el código
 

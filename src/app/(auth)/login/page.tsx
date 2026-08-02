@@ -7,16 +7,25 @@ import { getSessionUser } from "@/lib/auth/session";
 export const metadata = { title: "Ingresar — Cubicca" };
 
 /**
- * `/auth/callback` manda acá con `?error=auth` cuando no pudo canjear el code.
- * El motivo real ya quedó en el log del servidor: al usuario se le da un mensaje
- * accionable y nada más.
+ * Las rutas de `/auth/*` mandan acá con `?error=` cuando no pudieron establecer
+ * la sesión. El motivo técnico ya quedó en el log del servidor: al usuario se le
+ * da un mensaje accionable y nada más.
+ *
+ * `used` no es una falla del sistema sino el desenlace normal de re-clickear un
+ * link ya usado, así que va como `notice` —gris, informativo— y no como error en
+ * rojo. Cubre también el link vencido: Supabase devuelve el mismo error para los
+ * dos casos, y en ambos lo que corresponde hacer es iniciar sesión.
  */
 function initialStateFor(error: string | undefined): AuthFormState {
-  if (error !== "auth") {
-    return undefined;
+  if (error === "used") {
+    return { notice: "Este enlace ya se usó o venció. Si ya confirmaste tu cuenta, ingresá." };
   }
 
-  return { error: "No pudimos confirmar el enlace. Puede haber vencido o ya haberse usado." };
+  if (error === "auth") {
+    return { error: "No pudimos confirmar el enlace. Probá de nuevo o pedí uno nuevo." };
+  }
+
+  return undefined;
 }
 
 export default async function LoginPage({
