@@ -37,16 +37,36 @@ export type SessionProfile = SessionUser & {
  * Usa `getUser()`, no `getSession()`: el primero valida el token contra el
  * servidor de auth de Supabase, el segundo se cree lo que diga la cookie. Para
  * decidir permisos, la cookie sola no alcanza.
+ *
+ * ⚠️ Un fallo de verificación degrada a "deslogueado", nunca a excepción. Con
+ * una cookie vencida `getUser()` primero intenta refrescar (`/auth/v1/token`), y
+ * como el token renovado no se puede persistir durante el render (ver el límite
+ * conocido en architecture.md) el intento puede terminar mal. auth-js devuelve
+ * los `AuthError` por el campo `error`, pero cualquier otra cosa la relanza
+ * (`GoTrueClient._getUser`: `if (isAuthError(error)) return …; throw error`), y
+ * el `_acquireLock` que envuelve la llamada puede tirar por timeout sin pasar
+ * siquiera por ese catch. Propagar cualquiera de las dos revienta el render de
+ * una página pública con un 500 en vez de mostrar el form de login.
  */
 export const getSessionUser = cache(async (): Promise<SessionUser | null> => {
+  // Fuera del try a propósito: si falta una env var de Supabase, eso es un error
+  // de configuración y tiene que explotar fuerte. Degradarlo a "deslogueado"
+  // dejaría un deploy roto sirviendo pantallas de login para siempre.
   const supabase = await createSupabaseServerClient();
-  const { data, error } = await supabase.auth.getUser();
 
-  if (error || !data.user?.email) {
+  try {
+    const { data, error } = await supabase.auth.getUser();
+
+    if (error || !data.user?.email) {
+      return null;
+    }
+
+    return { userId: data.user.id, email: data.user.email };
+  } catch (cause) {
+    console.error("[session] getUser() tiró en vez de devolver error:", cause);
+
     return null;
   }
-
-  return { userId: data.user.id, email: data.user.email };
 });
 
 /** Como getSessionUser, pero manda a /login si no hay sesión. */

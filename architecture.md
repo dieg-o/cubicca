@@ -245,16 +245,52 @@ El flujo completo, y qué pieza sostiene cada tramo:
   proxy. Cambiarlas exige rebuild; pasarlas por env al arrancar el server no
   tiene efecto.
 
-### Límite conocido: refresh del token
+### Límite conocido: refresh del token — cookie-only asumido para el MVP
 
 El proxy no refresca la sesión (es cookie-only por diseño). Supabase refresca al
 llamar `getUser()`, pero durante el render de un Server Component las cookies son
 de solo lectura, así que el token renovado **no se persiste**. Las escrituras de
 cookie que sí funcionan son las de los server actions (login, signup, logout).
-En la práctica esto significa que una sesión cuyo access token venció entre
-navegaciones puede terminar mandando al usuario a `/login` antes de tiempo.
-Si aparece, la solución es que el proxy llame a `getUser()` y escriba las
-cookies renovadas en la respuesta — a costa de una llamada de red por request.
+
+**Decisión (MVP): nos quedamos con cookie-only y asumimos el re-login.** El costo
+del upgrade es una llamada de auth por request, incluidos los prefetch del
+router, y no lo vale todavía.
+
+Ojo con cómo se siente el límite: **no es un vencimiento a intervalo fijo**. Con
+uso continuo puede no aparecer nunca; aparece al **despertar una pestaña
+dormida**, cuando el access token venció entre navegaciones y el render no puede
+persistir el renovado.
+
+Lo que sí es obligatorio mientras vivamos con esto es que el fallo degrade
+suave. Dos medidas, las dos en el código:
+
+1. **El `setAll` del server client va en try/catch** (`src/lib/supabase/server.ts`).
+   En contexto RSC escribir cookies tira; ahí el `setAll` tiene que ser un no-op
+   seguro, no una excepción.
+2. **Un `getUser()` que falla degrada a "deslogueado"**
+   (`src/lib/auth/session.ts`): devuelve `null` y la página pública se renderiza.
+   No alcanza con mirar el campo `error`: auth-js devuelve los `AuthError` por
+   ahí, pero **relanza** cualquier otra cosa
+   (`GoTrueClient._getUser`: `if (isAuthError(error)) return …; throw error`), y
+   el `_acquireLock` que envuelve la llamada puede tirar por timeout sin pasar
+   por ese catch. Por eso la llamada va envuelta en try/catch.
+   La construcción del cliente queda **fuera** del try: si falta una env var eso
+   es error de configuración y tiene que explotar, no disfrazarse de sesión
+   ausente.
+
+**Qué contiene y qué no la medida 2.** Una cookie inválida/vencida dispara el
+refresh del token en el render, pero auth-js la devuelve como `AuthError`
+manejado (`isAuthError`) → la página degrada a deslogueado y responde 200. La
+medida 2 **NO** evita el 500 en ese caso (ya daba 200); su valor es contener
+throws que auth-js **NO** clasifica como `AuthError` (p. ej. timeout de
+`_acquireLock`, que escapa al catch interno de `_getUser`). El 500 observado en
+prod (Status 0) no está reproducido; hipótesis viva: un throw no-`AuthError`
+durante el render, ahora contenido por la medida 2. Pendiente: capturar el stack
+real de Vercel.
+
+**Upgrade path, cuando duela:** mover el refresh al `proxy.ts` — que llame a
+`getUser()` y escriba las cookies renovadas en la respuesta, a costa de esa
+llamada de red por request. No ahora.
 
 ### Verificación
 
