@@ -18,7 +18,10 @@ dashboard). `signUp()` devuelve sesión directa y el alta va derecho a
 `/onboarding`. `/auth/confirm` y `/auth/callback` quedan en el repo, dormidas.
 **TD-003 -> HECHO**: proyectos (CRUD mínimo), upload de PDF directo a Storage,
 viewer con pdf.js y diagnóstico vector/raster persistido.
-**Próximo: TD-004** (calibración: `scaleFactor` / `unit` en `plans`).
+**TD-004 -> HECHO**: calibración de escala por plano (el usuario marca una cota
+conocida) + motor geométrico puro y testeado en `src/lib/geometry/`.
+**Próximo: TD-005** (herramientas de medición: largo / muro / área con
+persistencia).
 
 ## TD-001 — Bootstrap CORE
 
@@ -533,3 +536,136 @@ de texto, y **cuánto de la página tapa la imagen más grande**.
 veredicto sobre PDFs de obra de verdad —el dato que decide el enfoque de la
 auto-detección de muros— todavía no se puede reportar. Subir dos o tres planos
 reales y mirar el desglose por página.
+
+## TD-004 — Calibración de escala y motor geométrico
+
+Lo que convierte al viewer en una herramienta de cubicación: saber cuánto mide
+en la realidad lo que se ve en el plano. Dos cimientos, ninguna herramienta de
+medición todavía (eso es TD-005).
+
+### El motor geométrico: `src/lib/geometry/`
+
+Funciones puras, sin React, sin Next, sin pdf.js: `distance`, `polylineLength`,
+`polygonArea` (shoelace), `toMeters`, `scaleFactorFromCalibration`,
+`applyScaleLength`, `applyScaleArea`. `npm test` (vitest) corre 20 casos contra
+resultados conocidos — 3-4-5, cuadrado de 2×2, triángulo de base 4 y altura 3 —
+en 300 ms y sin levantar nada.
+
+Que sea puro no es prolijidad: es lo que permite que las cuentas del negocio se
+verifiquen sin browser ni base, y que el server pueda hacerlas sin importar una
+línea de UI.
+
+**Dos convenciones que valen para todo el sistema:**
+
+1. **Los puntos van en USER-SPACE del PDF, nunca en píxeles.** Un píxel depende
+   del zoom, del ancho de la ventana y del DPR de la pantalla; el user-space es
+   del documento y no se mueve. La conversión ocurre en un solo lugar —el
+   viewer— y de ahí para adentro no entra un píxel.
+2. **Toda longitud real está en METROS.** `scaleFactor` son metros por unidad de
+   user-space. El usuario tipea en m/cm/mm y se normaliza en el borde. De ahí
+   salen las dos fórmulas: `longitud real = longitud_pdf × scaleFactor` y
+   `área real = área_pdf × scaleFactor²`.
+
+**Invariantes que los tests fijan, y por qué cada uno:**
+
+- **`polylineLength` NO cierra la figura.** Un cuadrado unitario marcado con sus
+  4 vértices mide 3, no 4: el usuario marcó tres segmentos, y cerrarlo por
+  nuestra cuenta sería inventarle un cuarto muro.
+- **`polygonArea` SÍ cierra, y devuelve valor absoluto.** El signo del shoelace
+  solo dice si se marcó en sentido horario o antihorario; un área negativa
+  porque el usuario giró para el otro lado no significa nada físico.
+- **El área lleva el factor al cuadrado.** 400 unidades² con `scaleFactor` 0,05
+  son 1 m², no 20. Es el error que más caro sale y por eso tiene su test.
+- **Las divisiones tienen guarda.** Dos puntos en el mismo lugar (doble click,
+  que pasa) darían `Infinity`, y ese infinito quedaría persistido envenenando
+  toda medición futura del plano. Rompe con mensaje, no con un número.
+
+### Calibración: el cliente marca, el servidor calcula
+
+| Paso | Dónde | Qué pasa |
+| --- | --- | --- |
+| Marcar | Browser | Dos clicks sobre una cota conocida; cada uno se convierte a user-space con `viewport.convertToPdfPoint()` |
+| Tipear | Browser | La medida real + su unidad (m/cm/mm) |
+| Derivar | `calibratePlan` (server action) | Zod valida; el motor calcula `pdfDistance`, `realMeters` y `scaleFactor` |
+| Guardar | `getTenantPrisma(orgId)` | `plans.scaleFactor` + `plans.calibrationJson` |
+
+**El `scaleFactor` NO viaja desde el cliente.** Un server action es un POST
+alcanzable sin pasar por la UI: si el factor viniera del browser, alcanzaría un
+POST a mano para declarar cualquier escala y todas las cubicaciones del plano
+saldrían de un número que nadie derivó. Lo que viaja son los dos puntos y la
+cota; la cuenta es del servidor. Es la misma decisión que en el diagnóstico
+vector/raster de TD-003, por la misma razón.
+
+- **`calibrationJson` guarda el CÓMO, no solo el cuánto**: página, los dos
+  puntos, el valor y la unidad tipeados, la distancia PDF y el timestamp. Sin
+  eso, un factor sospechoso no se puede revisar; con eso, se rehace la cuenta
+  sin volver a marcar nada.
+- **Solo se calibran planos `READY`**, y el `pageIndex` se valida contra el
+  `pageCount` real del documento.
+- **Recalibrar sobrescribe.** Hay un solo factor por plano y el registro nuevo
+  es el que lo explica.
+- **La escala 1:N que muestra la UI es comodidad de lectura, no un dato del
+  sistema.** El sistema mide con `scaleFactor`; el 1:N sirve para el control que
+  cualquier arquitecto hace de memoria contra el cajetín del plano.
+
+### El punto delicado: click → user-space
+
+Está todo en `pdf-viewer.tsx`, y son tres detalles que importan:
+
+- **El viewport que traduce clicks es el CSS, no el del render.** El canvas se
+  dibuja multiplicado por el `devicePixelRatio` (topeado en 2) para que las
+  líneas finas no salgan borrosas; usar ESE viewport para los clicks daría
+  puntos corridos por 2 en cualquier pantalla retina — un error que en un
+  monitor común no se ve nunca. Por eso se guarda aparte el viewport a escala
+  CSS.
+- **`getBoundingClientRect()` para el origen.** Da la caja del canvas ya
+  resuelta (scroll, layout), así que restarla de `clientX/Y` da coordenadas
+  relativas al canvas, que es exactamente el espacio del viewport CSS.
+  `convertToPdfPoint` hace el resto, incluida la rotación de la página y que el
+  eje Y del PDF vaya para arriba y el de la pantalla para abajo.
+- **El overlay va de vuelta por el mismo camino** (`convertToViewportPoint`), y
+  por eso las marcas quedan pegadas al plano al hacer zoom en vez de flotar
+  donde se clickeó. Es también la verificación visual de que el viaje de ida y
+  vuelta cierra.
+- **`convertToPdfPoint` está tipada como `any[]` en pdfjs-dist.** El resultado
+  entra por `unknown` y se estrecha a mano (`readPair`): ese `any` de la
+  librería no se cuela adentro nuestro.
+
+### Límite conocido: una escala por plano
+
+El MVP guarda **un** `scaleFactor` por plano, junto con la página sobre la que se
+calibró. Una lámina con dos escalas distintas (la planta en 1:50 y un detalle en
+1:20, algo habitual) no está cubierta: mediciones sobre el detalle van a salir
+mal, y hoy nada las frena.
+
+**Multi-escala queda DIFERIDO.** Cuando haga falta, el camino es mover la
+calibración a una fila por página o por región, no agregarle campos a `plans`.
+El `calibrationJson` ya guarda el `pageIndex`, así que la migración tiene de
+dónde agarrarse.
+
+### Verificación
+
+- `npm test`: 20 casos del motor en verde.
+- `npm run db:test-isolation`: 4 casos nuevos, específicos de calibrar —
+  calibrar por id un plano de otra org, hacerlo por `updateMany` con el
+  `organizationId` ajeno en el where, una calibración masiva que no puede
+  desbordar el tenant, y la comprobación de que el plano ajeno sigue sin
+  calibrar.
+- **E2E contra el plano REAL de Diego** (`FUNDACIONES.pdf`, 3370×2384 pt,
+  rotada 270°): se marcó la cadena de cotas completa —17,89 m entre dos ticks
+  separados 1014,12 unidades de user-space, valor sacado de las 16 etiquetas del
+  propio plano— y la app derivó **1:50,01**. El cajetín del plano dice
+  "escala 1/50": la verificación es independiente del dato que se le dio.
+- **Invariancia al zoom**, la misma cota marcada a dos zooms distintos (×2,44
+  entre uno y otro):
+
+  | | plano real (FUNDACIONES) | plano sintético (cota exacta de 300 u) |
+  | --- | --- | --- |
+  | ajustado al ancho | 0,017643686 (1:50,01) | 0,050014930 |
+  | ampliado ×2,44 | 0,017633458 (1:49,98) | 0,050010462 |
+  | valor exacto | 0,017640910 | 0,050000000 |
+  | diferencia entre ambos | **0,058 %** | **0,0089 %** |
+
+  El residuo es cuantización del click (el puntero cae en un píxel entero), no
+  del modelo: la conversión a user-space es exacta. Se achica marcando cotas
+  largas, que es lo que conviene hacer igual.

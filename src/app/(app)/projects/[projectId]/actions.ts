@@ -6,6 +6,12 @@ import { z } from "zod";
 
 import { requireProfile } from "@/lib/auth/session";
 import { getTenantPrisma } from "@/lib/db/tenant";
+import { distance, scaleFactorFromCalibration, toMeters } from "@/lib/geometry";
+import {
+  CALIBRATION_VERSION,
+  calibrationInputSchema,
+  type PlanCalibration,
+} from "@/lib/plans/calibration";
 import { PLAN_CONTENT_TYPE, PLAN_MAX_FILE_SIZE_BYTES } from "@/lib/plans/constants";
 import { diagnosePlan, diagnosisInputSchema } from "@/lib/plans/diagnosis";
 import { getSupabaseAdmin, PLANS_BUCKET } from "@/lib/supabase/admin";
@@ -240,5 +246,113 @@ export async function finalizePlanUpload(
     console.error("[plans] falló la confirmación del upload:", error);
 
     return { ok: false, error: "No se pudo confirmar la subida. Probá de nuevo." };
+  }
+}
+
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * Calibración de escala.
+ *
+ * El cliente marca dos puntos sobre una cota conocida y tipea cuánto mide en la
+ * realidad. Lo que llega son coordenadas en USER-SPACE del PDF —no píxeles— y
+ * la cota con su unidad; el `scaleFactor` lo deriva ESTE lado con el motor
+ * geométrico.
+ *
+ * Que el factor no venga del cliente es la decisión que sostiene todo lo demás:
+ * un action es un POST alcanzable sin pasar por la UI, y un `scaleFactor`
+ * declarado a mano se llevaría puestas todas las mediciones del plano sin que
+ * nada quede raro a la vista.
+ * ────────────────────────────────────────────────────────────────────────────
+ */
+
+export type CalibratePlanResult =
+  | { ok: true; scaleFactor: number; pdfDistance: number }
+  | { ok: false; error: string };
+
+const calibrateSchema = z.object({
+  planId: z.uuid("Plano inválido."),
+  calibration: calibrationInputSchema,
+});
+
+export async function calibratePlan(
+  planId: string,
+  calibration: unknown
+): Promise<CalibratePlanResult> {
+  const profile = await requireProfile();
+
+  const parsed = calibrateSchema.safeParse({ planId, calibration });
+
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: parsed.error.issues[0]?.message ?? "Los datos de la calibración no son válidos.",
+    };
+  }
+
+  const { pageIndex, pdfPointA, pdfPointB, enteredValue, enteredUnit } = parsed.data.calibration;
+
+  const db = getTenantPrisma(profile.organizationId);
+
+  // Pertenencia: la primitiva inyecta el organizationId en el where, así que un
+  // plano de otra organización no existe desde acá. No hace falta —ni conviene—
+  // distinguir "no es tuyo" de "no existe".
+  const plan = await db.plan.findUnique({
+    where: { id: parsed.data.planId },
+    select: { id: true, status: true, pageCount: true },
+  });
+
+  if (!plan) {
+    return { ok: false, error: "El plano no existe." };
+  }
+
+  // Un plano PENDING no tiene bytes confirmados en Storage: calibrar contra algo
+  // que todavía no está subido no significa nada.
+  if (plan.status !== "READY") {
+    return { ok: false, error: "El plano todavía se está subiendo." };
+  }
+
+  // El pageIndex viene del cliente, así que se valida contra el documento real.
+  if (plan.pageCount !== null && pageIndex >= plan.pageCount) {
+    return { ok: false, error: "Esa página no existe en el plano." };
+  }
+
+  try {
+    // Las tres cuentas del TD, todas del motor puro y todas de este lado.
+    const pdfDistance = distance(pdfPointA, pdfPointB);
+    const realMeters = toMeters(enteredValue, enteredUnit);
+    const scaleFactor = scaleFactorFromCalibration(pdfDistance, realMeters);
+
+    const record: PlanCalibration = {
+      version: CALIBRATION_VERSION,
+      pageIndex,
+      pdfPointA,
+      pdfPointB,
+      enteredValue,
+      enteredUnit,
+      pdfDistance,
+      realMeters,
+      calibratedAt: new Date().toISOString(),
+    };
+
+    // Recalibrar sobrescribe: hay un solo factor por plano (ver el límite
+    // conocido de multi-escala en architecture.md), y el registro anterior
+    // queda reemplazado por el nuevo, que es el que explica el factor vigente.
+    await db.plan.update({
+      where: { id: plan.id },
+      data: { scaleFactor, calibrationJson: record },
+      select: { id: true },
+    });
+
+    return { ok: true, scaleFactor, pdfDistance };
+  } catch (error) {
+    // Acá caen las guardas del motor (dos puntos en el mismo lugar, cota <= 0)
+    // y cualquier fallo de la base. El detalle al log; al usuario, algo que
+    // pueda accionar.
+    console.error("[plans] falló la calibración:", error);
+
+    return {
+      ok: false,
+      error: "No se pudo calibrar. Marcá dos puntos separados y revisá la medida.",
+    };
   }
 }

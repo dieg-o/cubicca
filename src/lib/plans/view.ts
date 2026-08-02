@@ -1,3 +1,4 @@
+import { parseStoredCalibration, type PlanCalibration } from "@/lib/plans/calibration";
 import { parseStoredDiagnosis, type PlanDiagnosis } from "@/lib/plans/diagnosis";
 
 /**
@@ -17,6 +18,9 @@ export type PlanSummary = {
   hasVectorGeometry: boolean | null;
   createdAt: string;
   diagnosis: PlanDiagnosis | null;
+  /** Metros por unidad de user-space. `null` = el plano no se calibró todavía. */
+  scaleFactor: number | null;
+  calibration: PlanCalibration | null;
 };
 
 /** Forma mínima de la fila que necesita el mapeo (no importa Prisma acá). */
@@ -29,6 +33,8 @@ type PlanRow = {
   hasVectorGeometry: boolean | null;
   createdAt: Date;
   diagnosisJson: unknown;
+  scaleFactor: number | null;
+  calibrationJson: unknown;
 };
 
 export function toPlanSummary(plan: PlanRow): PlanSummary {
@@ -43,5 +49,7 @@ export function toPlanSummary(plan: PlanRow): PlanSummary {
     // La columna es `Json`: lo que hay adentro lo escribió una versión anterior
     // del código. Si no valida, se muestra el plano sin desglose y listo.
     diagnosis: parseStoredDiagnosis(plan.diagnosisJson),
+    scaleFactor: plan.scaleFactor,
+    calibration: parseStoredCalibration(plan.calibrationJson),
   };
 }

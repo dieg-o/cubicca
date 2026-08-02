@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test": "vitest run",
     "db:smoke": "tsx scripts/smoke-db.ts",
     "db:test-isolation": "tsx scripts/test-tenant-isolation.ts",
     "postinstall": "prisma generate && node scripts/copy-pdf-worker.mjs"
@@ -43,6 +44,7 @@
     "prisma": "^7.9.1",
     "tailwindcss": "^4",
     "tsx": "^4.23.1",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^4.1.10"
   }
 }

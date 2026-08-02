@@ -326,6 +326,38 @@ async function main(): Promise<void> {
       db.plan.update({ where: { id: planA.id }, data: { organizationId: orgB.id } })
     );
 
+    // Calibrar es un update sobre `plans`, así que hereda el aislamiento de la
+    // primitiva. Se prueba igual con la forma exacta que usa calibratePlan: es
+    // la escritura con la que se van a computar metros, y un plano calibrado
+    // desde otra organización sería medir el edificio de otro.
+    await checkThrows("no se puede calibrar un plano de otra org (update por id)", () =>
+      db.plan.update({
+        where: { id: planB.id },
+        data: { scaleFactor: 0.05, calibrationJson: { version: 1 } },
+      })
+    );
+
+    await checkThrows("updateMany() con el organizationId ajeno en el where tampoco calibra", () =>
+      db.plan.updateMany({
+        where: { organizationId: orgB.id },
+        data: { scaleFactor: 0.05 },
+      })
+    );
+
+    const calibradosDesdeA = await db.plan.updateMany({ data: { scaleFactor: 0.05 } });
+    check(
+      "una calibración masiva desde A no toca los planos de B",
+      calibradosDesdeA.count === 4,
+      `calibró ${calibradosDesdeA.count} fila(s)`
+    );
+
+    const planBSinCalibrar = await raw.plan.findUnique({ where: { id: planB.id } });
+    check(
+      "el plano de la otra org sigue sin calibrar",
+      planBSinCalibrar !== null && planBSinCalibrar.scaleFactor === null,
+      `quedó con scaleFactor=${String(planBSinCalibrar?.scaleFactor)}`
+    );
+
     const planesTocados = await db.plan.updateMany({ data: { status: "READY" } });
     check(
       "plan.updateMany() sin where no alcanza filas de otra org",

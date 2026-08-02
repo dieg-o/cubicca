@@ -1,15 +1,17 @@
 "use client";
 
-import type { PDFDocumentProxy } from "pdfjs-dist";
+import type { PageViewport, PDFDocumentProxy } from "pdfjs-dist";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import type { Point } from "@/lib/geometry";
 import { loadPdfjs } from "@/lib/pdf/pdfjs";
 
 /**
  * ────────────────────────────────────────────────────────────────────────────
- * Viewer de PDF. Render + navegación + zoom, nada más.
+ * Viewer de PDF. Render + navegación + zoom + captura de puntos.
  *
- * Sin herramientas de dibujo, sin medición, sin calibración: eso es TD-004/005.
+ * Sin herramientas de medición: las de largo/área con persistencia son TD-005.
+ * Lo único que se marca acá es la calibración de escala.
  *
  * Dos orígenes posibles, y la diferencia importa:
  *  - `file`: el File que el usuario acaba de subir, todavía en memoria. No se
@@ -17,10 +19,35 @@ import { loadPdfjs } from "@/lib/pdf/pdfjs";
  *  - `plan`: un plano de una visita anterior. Se pide una URL firmada de vida
  *    corta a /api/plans/[planId]/file y pdf.js lee de ahí (con range requests,
  *    así que una planta de 30 MB empieza a mostrarse sin bajarse entera).
+ *
+ * ⚠️ LA REGLA DE COORDENADAS: hacia afuera de este componente los puntos salen
+ * SIEMPRE en user-space del PDF, nunca en píxeles. Un píxel depende del zoom,
+ * del ancho de la ventana y del DPR; el user-space es del documento. La
+ * conversión en las dos direcciones vive acá y en ningún otro lado.
  * ────────────────────────────────────────────────────────────────────────────
  */
 
 export type PdfSource = { kind: "file"; file: File } | { kind: "plan"; planId: string };
+
+/** Puntos a dibujar sobre una página concreta, en user-space. */
+export type PdfOverlay = {
+  /** 0-based, como se persiste. Si no coincide con la página a la vista, no se dibuja. */
+  pageIndex: number;
+  points: readonly Point[];
+};
+
+type PdfViewerProps = {
+  source: PdfSource;
+  /** Con esto en true, cada click sobre la página emite un punto. */
+  pickingPoints?: boolean;
+  overlay?: PdfOverlay | null;
+  /**
+   * Recibe el punto YA convertido a user-space, junto con la página donde se
+   * marcó. El pageIndex viaja con cada punto para que el padre no tenga que
+   * seguir en paralelo qué página está a la vista.
+   */
+  onPickPoint?: (point: Point, pageIndex: number) => void;
+};
 
 const MIN_SCALE = 0.1;
 const MAX_SCALE = 8;
@@ -51,7 +78,32 @@ async function fetchSignedUrl(planId: string): Promise<string> {
   return payload.url;
 }
 
-export function PdfViewer({ source }: { source: PdfSource }) {
+/**
+ * Lee un punto de los que devuelve pdf.js.
+ *
+ * `convertToPdfPoint` / `convertToViewportPoint` están tipados como `any[]` en
+ * pdfjs-dist. Entra por `unknown` y se estrecha a mano: es la forma de que ese
+ * `any` de la librería no se cuele adentro nuestro, que es justo lo que la regla
+ * "prohibido any" quiere evitar.
+ */
+function readPair(converted: unknown, context: string): Point {
+  if (
+    !Array.isArray(converted) ||
+    typeof converted[0] !== "number" ||
+    typeof converted[1] !== "number"
+  ) {
+    throw new Error(`${context} devolvió algo que no es un par de números.`);
+  }
+
+  return { x: converted[0], y: converted[1] };
+}
+
+export function PdfViewer({
+  source,
+  pickingPoints = false,
+  overlay = null,
+  onPickPoint,
+}: PdfViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   /** Escala realmente aplicada en el último render: el origen de los +/−. */
@@ -64,6 +116,17 @@ export function PdfViewer({ source }: { source: PdfSource }) {
   const [zoom, setZoom] = useState<ZoomMode>({ mode: "fit" });
   /** Cambia con cada resize para reejecutar el render en modo "ajustar". */
   const [containerWidth, setContainerWidth] = useState(0);
+  /**
+   * El viewport de la página a la vista, en unidades CSS (escala SIN el
+   * devicePixelRatio). Es el traductor entre lo que ve el usuario y el
+   * user-space, en las dos direcciones: clicks hacia adentro, marcas hacia
+   * afuera. Va en estado y no en un ref porque el overlay se dibuja con él.
+   *
+   * ⚠️ Tiene que ser el CSS, no el del render: ese va multiplicado por el DPR,
+   * y usarlo para los clicks daría puntos corridos por 2 en cualquier pantalla
+   * retina — un error que en un monitor común no se ve nunca.
+   */
+  const [cssViewport, setCssViewport] = useState<PageViewport | null>(null);
 
   // ── Apertura del documento ────────────────────────────────────────────────
   useEffect(() => {
@@ -177,6 +240,15 @@ export function PdfViewer({ source }: { source: PdfSource }) {
       renderTask = task;
 
       await task.promise;
+
+      if (cancelled) {
+        return;
+      }
+
+      // Después del render, no antes: el overlay se dibuja recién cuando hay
+      // página abajo. Es un setState dentro de un callback async, no en el
+      // cuerpo del efecto: no encadena renders.
+      setCssViewport(page.getViewport({ scale }));
     }
 
     render(pdf, canvas).catch((error: unknown) => {
@@ -200,7 +272,46 @@ export function PdfViewer({ source }: { source: PdfSource }) {
     setZoom({ mode: "manual", scale: clampScale(appliedScaleRef.current * factor) });
   }, []);
 
+  /**
+   * Click en píxeles CSS → punto en user-space.
+   *
+   * `getBoundingClientRect()` da la caja del canvas ya resuelta (scroll,
+   * layout), así que la resta contra `clientX/Y` da coordenadas relativas al
+   * canvas — que es exactamente el espacio del viewport CSS. De ahí,
+   * `convertToPdfPoint` hace el resto, incluida la rotación de la página y el
+   * hecho de que el eje Y del PDF va para arriba y el de la pantalla para abajo.
+   *
+   * Consecuencia buscada: el punto que sale NO depende del zoom ni del DPR.
+   */
+  function handleCanvasClick(event: React.MouseEvent<HTMLCanvasElement>) {
+    if (!pickingPoints || !onPickPoint || !cssViewport) {
+      return;
+    }
+
+    const rect = event.currentTarget.getBoundingClientRect();
+
+    try {
+      const point = readPair(
+        cssViewport.convertToPdfPoint(event.clientX - rect.left, event.clientY - rect.top),
+        "convertToPdfPoint"
+      );
+
+      onPickPoint(point, pageNumber - 1);
+    } catch (error) {
+      console.error("[viewer] no se pudo convertir el click a user-space:", error);
+      setErrorMessage("No se pudo tomar ese punto. Probá de nuevo.");
+    }
+  }
+
   const pageCount = pdf?.numPages ?? 0;
+
+  // La vuelta del mismo viaje: los puntos guardados en user-space se proyectan
+  // a píxeles CSS para dibujarlos. Por eso las marcas quedan pegadas al plano
+  // al hacer zoom, en vez de flotar donde se clickeó.
+  const overlayPoints =
+    cssViewport && overlay && overlay.pageIndex === pageNumber - 1
+      ? projectPoints(overlay.points, cssViewport)
+      : [];
 
   return (
     <div className="flex flex-col gap-3">
@@ -252,7 +363,47 @@ export function PdfViewer({ source }: { source: PdfSource }) {
           </p>
         ) : null}
 
-        <canvas ref={canvasRef} className={status === "ready" ? "bg-white" : "hidden"} />
+        {/* `relative` + `w-fit`: el overlay se posiciona contra el canvas, no
+            contra el contenedor scrolleable. */}
+        <div className={status === "ready" ? "relative w-fit" : "hidden"}>
+          <canvas
+            ref={canvasRef}
+            onClick={handleCanvasClick}
+            className={`block bg-white ${pickingPoints ? "cursor-crosshair" : ""}`}
+          />
+
+          {overlayPoints.length > 0 && cssViewport ? (
+            <svg
+              // pointer-events-none: el SVG tapa el canvas, y sin esto se comería
+              // el segundo click de la calibración.
+              className="pointer-events-none absolute left-0 top-0"
+              width={cssViewport.width}
+              height={cssViewport.height}
+              aria-hidden
+            >
+              {overlayPoints.length > 1 ? (
+                <polyline
+                  points={overlayPoints.map((point) => `${point.x},${point.y}`).join(" ")}
+                  fill="none"
+                  stroke="#dc2626"
+                  strokeWidth={2}
+                />
+              ) : null}
+
+              {overlayPoints.map((point, index) => (
+                <circle
+                  key={index}
+                  cx={point.x}
+                  cy={point.y}
+                  r={5}
+                  fill="#dc2626"
+                  stroke="white"
+                  strokeWidth={1.5}
+                />
+              ))}
+            </svg>
+          ) : null}
+        </div>
       </div>
 
       {status === "ready" && errorMessage ? (
@@ -262,6 +413,25 @@ export function PdfViewer({ source }: { source: PdfSource }) {
       ) : null}
     </div>
   );
+}
+
+/**
+ * user-space → píxeles CSS, para dibujar.
+ *
+ * Si algo viene mal (un punto corrupto en la base, una conversión que no
+ * devuelve un par), no se dibuja nada y queda el log: una marca torcida en un
+ * plano es peor que ninguna marca, porque se le cree.
+ */
+function projectPoints(points: readonly Point[], viewport: PageViewport): Point[] {
+  try {
+    return points.map((point) =>
+      readPair(viewport.convertToViewportPoint(point.x, point.y), "convertToViewportPoint")
+    );
+  } catch (error) {
+    console.error("[viewer] no se pudieron proyectar los puntos del overlay:", error);
+
+    return [];
+  }
 }
 
 function clampScale(scale: number): number {

@@ -108,6 +108,17 @@ model Plan {
   hasVectorGeometry Boolean? @map("has_vector_geometry")
   diagnosisJson     Json?    @map("diagnosis_json")
 
+  /// Calibración de escala: METROS por unidad de user-space del PDF.
+  /// `null` = sin calibrar. Es lo único que hace falta para medir: longitud
+  /// real = longitud_pdf × scaleFactor, área real = área_pdf × scaleFactor².
+  scaleFactor Float? @map("scale_factor")
+
+  /// Registro auditable de CÓMO se derivó ese factor: página, los dos puntos
+  /// en user-space, el valor y la unidad que tipeó el usuario, y la distancia
+  /// PDF medida. Sin esto, un factor sospechoso no se puede revisar ni
+  /// recalcular; con esto, se rehace la cuenta sin volver a marcar nada.
+  calibrationJson Json? @map("calibration_json")
+
   status    PlanStatus @default(PENDING)
   createdAt DateTime   @default(now()) @map("created_at")
   updatedAt DateTime   @updatedAt @map("updated_at")

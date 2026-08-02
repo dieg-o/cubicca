@@ -42,6 +42,8 @@ export default async function ProjectPage({ params }: PageProps<"/projects/[proj
           hasVectorGeometry: true,
           createdAt: true,
           diagnosisJson: true,
+          scaleFactor: true,
+          calibrationJson: true,
         },
       },
     },
