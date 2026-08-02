@@ -13,6 +13,9 @@ proxy, gate de profile y onboarding.
 clasifica como `AuthError`. Cookie-only asumido para el MVP.
 **TD-002-FIX-3**: confirmación de email por `token_hash` + `verifyOtp`
 (`/auth/confirm`). Destraba el E2E desde cualquier dispositivo.
+**TD-002-FIX-4**: **confirmación de email APAGADA para el MVP** (toggle del
+dashboard). `signUp()` devuelve sesión directa y el alta va derecho a
+`/onboarding`. `/auth/confirm` y `/auth/callback` quedan en el repo, dormidas.
 
 ## TD-001 — Bootstrap CORE
 
@@ -186,7 +189,30 @@ action**, no solo en el layout.
 - **Error de login genérico.** Distinguir "no existe" de "contraseña incorrecta"
   regala un enumerador de cuentas.
 
-### Confirmación de email: `token_hash` + `verifyOtp`
+### Confirmación de email: apagada en el MVP
+
+**Estado hoy: "Confirm email" está OFF en el dashboard** (Authentication →
+Sign In / Providers). Con el toggle apagado `supabase.auth.signUp()` devuelve
+`data.session` en la misma respuesta: no sale mail, no hay link que clickear y el
+alta termina en `/onboarding` sin salir del browser.
+
+**Por qué se apagó.** Dos razones, ninguna técnica. Supabase bloquea la edición
+del template de confirmación detrás de un SMTP propio, así que el paso 2 del
+flujo de abajo no se podía completar sin montar Resend primero. Y para un único
+usuario en el MVP, confirmar el mail es ceremonia: no protege nada que hoy
+importe.
+
+**El código no distingue los dos modos.** El server action ya ramifica por
+`data.session` (`src/app/(auth)/actions.ts`): con sesión redirige a
+`/onboarding`, sin sesión devuelve el `notice` de "revisá tu mail". Volver a
+prender el toggle no exige tocar código — por eso `/auth/confirm` y
+`/auth/callback` se dejan en el repo aunque hoy no las pise nadie.
+
+**TD pre-lanzamiento:** SMTP propio (Resend) + template apuntando a
+`/auth/confirm` + toggle en ON. Recién ahí aplica todo lo que sigue en esta
+sección, que se conserva como la especificación del flujo dormido.
+
+#### El flujo dormido: `token_hash` + `verifyOtp`
 
 El mail de alta **no va por PKCE**. Va por `token_hash`: el link trae un hash de
 un solo uso que se verifica con `verifyOtp()`, sin depender de ninguna cookie
@@ -323,7 +349,12 @@ llamada de red por request. No ahora.
 sin cookie, con cookie inválida y assets. `GET /api/_smoke` se eliminó: era del
 bootstrap y hoy sería una ruta sin auth que toca la base.
 
-**Pendiente:** el flujo PKCE de confirmación de email está tipado (`tsc --noEmit`
-verde) pero todavía **no se probó end-to-end** contra Supabase. Falta el signup
-real: mail → click → canje → sesión, con `NEXT_PUBLIC_SITE_URL` cargada en el
+**Pendiente:** el flujo de confirmación por mail —tanto `token_hash` como el
+PKCE que quedó para OAuth— está tipado (`tsc --noEmit` verde) pero **nunca se
+probó end-to-end** contra Supabase, y con el toggle en OFF no hay forma de
+probarlo. Queda para la TD pre-lanzamiento, junto con el SMTP propio: signup
+real → mail → click → canje → sesión, con `NEXT_PUBLIC_SITE_URL` cargada en el
 hosting y la URL dada de alta en Redirect URLs del dashboard.
+
+El E2E que sí aplica hoy es el del alta directa: signup con email fresco →
+sesión inmediata → `/onboarding` → crear organización → home.
