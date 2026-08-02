@@ -7,6 +7,8 @@ Bitácora de decisiones y estado por tarjeta técnica (TD).
 **TD-001 -> HECHO**: bootstrap CORE + primera migración + smoke pooler 6543 + `.env.example`.
 **TD-002 -> HECHO**: `getTenantPrisma` + tests de aislamiento, auth con Supabase,
 proxy, gate de profile y onboarding.
+**TD-002-FIX**: callback PKCE de confirmación de email (`/auth/callback`) +
+`emailRedirectTo`. Código listo, falta la prueba end-to-end.
 
 ## TD-001 — Bootstrap CORE
 
@@ -180,6 +182,56 @@ action**, no solo en el layout.
 - **Error de login genérico.** Distinguir "no existe" de "contraseña incorrecta"
   regala un enumerador de cuentas.
 
+### Confirmación de email: el flujo PKCE
+
+`@supabase/ssr` crea los clientes con `flowType: "pkce"` y eso no es opcional: lo
+fija la librería. La consecuencia es que **el link del mail no trae una sesión**,
+trae un `code` de un solo uso que hay que canjear contra el servidor de auth
+junto con el *code verifier* que quedó en una cookie al hacer el signUp. Sin un
+lugar donde canjearlo, el signup nunca termina.
+
+El flujo completo, y qué pieza sostiene cada tramo:
+
+| Paso | Dónde | Qué pasa |
+| --- | --- | --- |
+| 1. signUp | `src/app/(auth)/actions.ts` | Manda `emailRedirectTo` y deja el code verifier en una cookie |
+| 2. click en el mail | — | Supabase redirige a `<origin>/auth/callback?code=…` |
+| 3. el proxy deja pasar | `src/proxy.ts` | `/auth/callback` está en `PUBLIC_PATHS` |
+| 4. canje | `src/app/auth/callback/route.ts` | `exchangeCodeForSession()` escribe las cookies de sesión |
+| 5. destino | idem | Redirige a `safeNextPath(next)`; el gate real deriva a `/onboarding` si falta org |
+
+- **El callback es un Route Handler, no una página.** El canje **escribe**
+  cookies, y durante el render de un Server Component el store de cookies es de
+  solo lectura — el mismo motivo por el que login y signup son server actions.
+  En un Route Handler `cookies().set()` sí funciona, así que
+  `createSupabaseServerClient()` sirve tal cual está.
+- **`/auth/callback` va en `PUBLIC_PATHS` por obligación, no por comodidad.**
+  Quien llega ahí todavía NO tiene sesión: esa es la razón de existir de la ruta.
+  Si el proxy la mandara a `/login`, el code quedaría sin canjear. Sigue dentro
+  del matcher —el proxy corre— pero no se redirige.
+- **`emailRedirectTo` se resuelve en el server action.** Sin ese parámetro
+  Supabase usa el Site URL del dashboard —la raíz— y el code aterriza en una
+  página que no sabe canjearlo. Manda `NEXT_PUBLIC_SITE_URL` si está (en prod el
+  dominio es fijo y no conviene depender de un header); si no, se usa el `Origin`
+  del request, que en un Server Action Next ya valida contra el Host.
+  ⚠️ La URL tiene que estar cargada en **Authentication → URL Configuration →
+  Redirect URLs** del dashboard de Supabase, o el canje se rechaza. Y al ser una
+  `NEXT_PUBLIC_*` se inlinea en build time: cambiarla en el hosting exige
+  redeploy, no alcanza con reiniciar (ver la sección de Next más abajo).
+- **Red de contención para el `code` huérfano.** Si el Site URL del dashboard
+  apunta a la raíz, o si un mail viejo sigue apuntando ahí, el code cae en `/`.
+  El proxy lo detecta (`!hasSession && pathname === "/" && searchParams.has("code")`)
+  y lo reenvía al callback con la query intacta. El `!hasSession` no es un
+  detalle: con sesión, `/` renderiza bien y un code sobrante se ignora; mandarlo
+  igual al callback sería un rebote de más por un code que casi seguro ya se usó.
+- **Todos los errores del canje terminan en `/login?error=auth`.** El motivo real
+  va al log del servidor; al usuario se le da un mensaje accionable y nada más.
+  El caso más común no es un ataque: el usuario abrió el mail en otro browser o
+  dispositivo, así que la cookie con el code verifier no está.
+- **`safeNextPath()` se mudó a `src/lib/auth/redirects.ts`.** Lo usan los dos
+  lados del flujo —los server actions y el callback— y en ambos un `//evil.com`
+  o un `https://…` sin sanear serían un open redirect.
+
 ### Cosas de esta versión de Next que condicionaron el código
 
 - **`middleware.ts` ahora es `proxy.ts`** (Next 16), exporta `proxy`, corre en
@@ -209,3 +261,8 @@ cookies renovadas en la respuesta — a costa de una llamada de red por request.
 `npm run build` verde. Ruteo probado con curl contra el build de producción:
 sin cookie, con cookie inválida y assets. `GET /api/_smoke` se eliminó: era del
 bootstrap y hoy sería una ruta sin auth que toca la base.
+
+**Pendiente:** el flujo PKCE de confirmación de email está tipado (`tsc --noEmit`
+verde) pero todavía **no se probó end-to-end** contra Supabase. Falta el signup
+real: mail → click → canje → sesión, con `NEXT_PUBLIC_SITE_URL` cargada en el
+hosting y la URL dada de alta en Redirect URLs del dashboard.

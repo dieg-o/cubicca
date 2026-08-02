@@ -11,6 +11,8 @@ type CredentialsFormProps = {
   submitLabel: string;
   /** A dónde volver después de loguearse; se manda como campo oculto. */
   next?: string;
+  /** Mensaje ya presente al pintar el form (ej. el callback de auth falló). */
+  initialState?: AuthFormState;
   footer: { question: string; linkLabel: string; href: string };
 };
 
@@ -23,9 +25,12 @@ export function CredentialsForm({
   title,
   submitLabel,
   next,
+  initialState,
   footer,
 }: CredentialsFormProps) {
-  const [state, formAction, pending] = useActionState(action, undefined);
+  // El estado inicial lo pisa la primera respuesta del action, así que un
+  // mensaje que venía de la URL no queda pegado después de intentar entrar.
+  const [state, formAction, pending] = useActionState(action, initialState);
 
   return (
     <div className="w-full max-w-sm space-y-6">

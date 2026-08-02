@@ -25,8 +25,19 @@ import type { NextRequest } from "next/server";
  * ────────────────────────────────────────────────────────────────────────────
  */
 
-/** Rutas que se ven sin sesión. Todo lo demás requiere estar logueado. */
-const PUBLIC_PATHS: ReadonlySet<string> = new Set(["/login", "/signup"]);
+/** Único lugar donde se puede canjear un `code` de PKCE por una sesión. */
+const AUTH_CALLBACK_PATH = "/auth/callback";
+
+/**
+ * Rutas que se ven sin sesión. Todo lo demás requiere estar logueado.
+ *
+ * `/auth/callback` está acá por obligación, no por comodidad: es donde se canjea
+ * el `code` del mail de confirmación por una sesión, así que por definición
+ * llega SIN sesión. Mandarlo a `/login` dejaría el code sin canjear y el signup
+ * nunca terminaría. Sigue dentro del matcher —el proxy corre— pero no se
+ * redirige.
+ */
+const PUBLIC_PATHS: ReadonlySet<string> = new Set(["/login", "/signup", AUTH_CALLBACK_PATH]);
 
 /**
  * Nombre de la cookie de sesión de Supabase: `sb-<project-ref>-auth-token`,
@@ -57,9 +68,28 @@ function hasSessionCookie(request: NextRequest): boolean {
 }
 
 export function proxy(request: NextRequest): NextResponse {
-  const { pathname } = request.nextUrl;
+  const { pathname, searchParams } = request.nextUrl;
   const isPublic = PUBLIC_PATHS.has(pathname);
   const hasSession = hasSessionCookie(request);
+
+  /*
+   * Red de contención para el `code` huérfano: si el Site URL del dashboard de
+   * Supabase apunta a la raíz —o si algún mail viejo sigue apuntando ahí— el
+   * code aterriza en `/` en vez del callback. Sin sesión todavía, `/` no puede
+   * hacer nada con él más que fallar, así que se lo pasamos al único lugar que
+   * sabe canjearlo, con la query intacta.
+   *
+   * El `!hasSession` no es un detalle: con sesión, `/` renderiza bien y el code
+   * sobrante se ignora; mandarlo igual al callback sería un rebote de más por un
+   * code que casi seguro ya está usado.
+   */
+  if (!hasSession && pathname === "/" && searchParams.has("code")) {
+    const callback = new URL(AUTH_CALLBACK_PATH, request.nextUrl);
+
+    callback.search = request.nextUrl.search;
+
+    return NextResponse.redirect(callback);
+  }
 
   if (!hasSession && !isPublic) {
     const login = new URL("/login", request.nextUrl);

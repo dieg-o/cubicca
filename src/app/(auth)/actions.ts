@@ -1,7 +1,9 @@
 "use server";
 
+import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 
+import { safeNextPath } from "@/lib/auth/redirects";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 /**
@@ -17,16 +19,29 @@ export type AuthFormState = { error?: string; notice?: string } | undefined;
 const MIN_PASSWORD_LENGTH = 8;
 
 /**
- * Sanea el `next` del login.
+ * A dónde tiene que volver el link del mail de confirmación.
  *
- * Solo se acepta una ruta interna: tiene que empezar con una sola `/`. Un
- * `//evil.com` es una URL protocol-relative y un `https://...` es absoluta —
- * cualquiera de las dos convertiría el login en un open redirect.
+ * En PKCE el mail no trae una sesión sino un `code` que hay que canjear, y eso
+ * solo puede pasar en `/auth/callback`. Sin este parámetro Supabase usa el Site
+ * URL del dashboard —la raíz— y el code cae en una página que no sabe canjearlo.
+ *
+ * `NEXT_PUBLIC_SITE_URL` manda si está seteada: en prod el dominio es fijo y no
+ * conviene que dependa de un header. Si no está, se usa el `Origin` del request,
+ * que en un Server Action Next ya valida contra el Host. Como último recurso se
+ * devuelve `undefined` y Supabase cae al Site URL: el proxy redirige `/?code=…`
+ * al callback, así que el flujo sigue funcionando igual.
  */
-function safeNextPath(value: FormDataEntryValue | null): string {
-  const path = typeof value === "string" ? value : "";
+async function getEmailRedirectTo(): Promise<string | undefined> {
+  const configured = process.env.NEXT_PUBLIC_SITE_URL?.trim();
+  const origin = configured ? configured.replace(/\/+$/, "") : (await headers()).get("origin");
 
-  return path.startsWith("/") && !path.startsWith("//") ? path : "/";
+  if (!origin) {
+    console.error("[signup] no se pudo resolver el origin: se manda el mail sin emailRedirectTo.");
+
+    return undefined;
+  }
+
+  return `${origin}/auth/callback`;
 }
 
 function readCredentials(formData: FormData): {
@@ -79,7 +94,11 @@ export async function signup(_state: AuthFormState, formData: FormData): Promise
   }
 
   const supabase = await createSupabaseServerClient();
-  const { data, error } = await supabase.auth.signUp({ email, password });
+  const { data, error } = await supabase.auth.signUp({
+    email,
+    password,
+    options: { emailRedirectTo: await getEmailRedirectTo() },
+  });
 
   if (error) {
     console.error("[signup] falló signUp:", error.message);
