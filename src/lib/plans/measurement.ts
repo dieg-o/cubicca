@@ -27,7 +27,10 @@ export const MEASUREMENT_TYPES = ["LARGO_CONTINUO", "MURO", "AREA"] as const;
 
 export type MeasurementType = (typeof MEASUREMENT_TYPES)[number];
 
-export const measurementTypeSchema = z.enum(MEASUREMENT_TYPES);
+export const measurementTypeSchema = z.enum(
+  MEASUREMENT_TYPES,
+  "Herramienta de medición desconocida."
+);
 
 /** Cómo se llama cada herramienta y qué devuelve. */
 export const MEASUREMENT_META: Readonly<
@@ -48,9 +51,17 @@ export const MEASUREMENT_META: Readonly<
  */
 export const VALUE_MISMATCH_EPSILON = 1e-9;
 
+/**
+ * Todo mensaje de este schema puede terminar en pantalla: el server action
+ * devuelve `parsed.error.issues[0].message` tal cual al cliente. Por eso van
+ * TODOS escritos, y en castellano — el default de Zod es en inglés y desentona
+ * con el resto de la app (lo pescó el E2E de TD-005).
+ */
+const INVALID_POINT = "Los puntos de la medición no son válidos.";
+
 const pointSchema = z.object({
-  x: z.number().finite(),
-  y: z.number().finite(),
+  x: z.number(INVALID_POINT).finite(INVALID_POINT),
+  y: z.number(INVALID_POINT).finite(INVALID_POINT),
 });
 
 /**
@@ -60,24 +71,53 @@ const pointSchema = z.object({
  * sino porque el `geometryJson` viaja en cada carga de la página y una
  * polilínea de 50.000 puntos es un error de la UI, no un contorno de obra.
  */
-export const pointsSchema = z.array(pointSchema).min(2).max(500);
+export const pointsSchema = z
+  .array(pointSchema)
+  .min(2, "Marcá al menos 2 puntos.")
+  .max(500, "Una medición no puede tener más de 500 vértices.");
+
+/**
+ * El mensaje del mínimo de vértices, que depende de la herramienta.
+ *
+ * `issue.input` es el objeto que se estaba validando y llega como `unknown`: se
+ * lee el `type` con cuidado en vez de castear el objeto entero.
+ */
+function minPointsMessage(input: unknown): string {
+  const type =
+    typeof input === "object" && input !== null && "type" in input ? input.type : null;
+
+  return type === "AREA" ? "Un área necesita al menos 3 puntos." : "Marcá al menos 2 puntos.";
+}
 
 export const createMeasurementSchema = z
   .object({
     planId: z.uuid("Plano inválido."),
     type: measurementTypeSchema,
-    pageIndex: z.number().int().nonnegative(),
+    pageIndex: z
+      .number("La página del plano no es válida.")
+      .int("La página del plano no es válida.")
+      .nonnegative("La página del plano no es válida."),
     points: pointsSchema,
     /** Altura del muro en metros. Obligatoria para MURO, prohibida para el resto. */
-    alto: z.number().positive().max(100).nullable(),
-    label: z.string().trim().max(120).nullable(),
+    alto: z
+      .number("El alto del muro no es válido.")
+      .positive("El alto del muro debe ser mayor a 0.")
+      .max(100, "El alto del muro no puede pasar de 100 m.")
+      .nullable(),
+    label: z
+      .string("La etiqueta no es válida.")
+      .trim()
+      .max(120, "La etiqueta es demasiado larga.")
+      .nullable(),
     /** Lo que mostró el cliente mientras dibujaba. Se compara, no se persiste. */
-    previewValue: z.number().positive().finite(),
+    previewValue: z
+      .number("El valor previsualizado no es válido.")
+      .positive("El valor previsualizado no es válido.")
+      .finite("El valor previsualizado no es válido."),
   })
-  .refine(
-    (value) => value.points.length >= MEASUREMENT_META[value.type].minPoints,
-    "Faltan vértices para esta medición."
-  )
+  .refine((value) => value.points.length >= MEASUREMENT_META[value.type].minPoints, {
+    error: (issue) => minPointsMessage(issue.input),
+  })
   .refine(
     (value) => (value.type === "MURO" ? value.alto !== null : value.alto === null),
     "El alto es obligatorio para un muro y no corresponde en los otros tipos."
