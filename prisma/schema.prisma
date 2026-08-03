@@ -23,6 +23,16 @@ enum PlanStatus {
   READY
 }
 
+/// Las tres formas de medir sobre un plano, y lo que devuelve cada una:
+///   LARGO_CONTINUO -> metros    (polilínea)
+///   MURO           -> m²        (polilínea × alto)
+///   AREA           -> m²        (polígono cerrado)
+enum MeasurementType {
+  LARGO_CONTINUO
+  MURO
+  AREA
+}
+
 model Organization {
   id        String   @id @default(uuid()) @db.Uuid
   name      String
@@ -30,9 +40,10 @@ model Organization {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  profiles Profile[]
-  projects Project[]
-  plans    Plan[]
+  profiles     Profile[]
+  projects     Project[]
+  plans        Plan[]
+  measurements Measurement[]
 
   @@map("organizations")
 }
@@ -123,7 +134,51 @@ model Plan {
   createdAt DateTime   @default(now()) @map("created_at")
   updatedAt DateTime   @updatedAt @map("updated_at")
 
+  measurements Measurement[]
+
   @@index([organizationId])
   @@index([projectId])
   @@map("plans")
+}
+
+/// Una medición dibujada sobre un plano calibrado.
+///
+/// `computedValue` es el resultado en unidades REALES y lo calcula siempre el
+/// servidor a partir de `geometryJson` + el `scaleFactor` del plano: el valor
+/// que muestra el cliente mientras dibuja es preview y nunca se persiste.
+/// Guardar los puntos y no solo el número es lo que permite recalcular todo si
+/// mañana se corrige la calibración del plano.
+model Measurement {
+  id String @id @default(uuid()) @db.Uuid
+
+  organizationId String       @map("organization_id") @db.Uuid
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  planId String @map("plan_id") @db.Uuid
+  plan   Plan   @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  type MeasurementType
+
+  /// 0-based. Tiene que coincidir con la página sobre la que se calibró: un
+  /// scaleFactor derivado de la planta no dice nada sobre un detalle en otra hoja.
+  pageIndex Int @map("page_index")
+
+  /// Los vértices en USER-SPACE del PDF: [{x,y},…]. Nunca píxeles.
+  geometryJson Json @map("geometry_json")
+
+  /// Metros para LARGO_CONTINUO, m² para MURO y AREA.
+  computedValue Float @map("computed_value")
+
+  /// Altura en metros. Solo para MURO; para el resto es null.
+  alto Float?
+
+  /// Etiqueta libre del usuario. El catálogo de partidas es TD-006.
+  label String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([organizationId])
+  @@index([planId])
+  @@map("measurements")
 }

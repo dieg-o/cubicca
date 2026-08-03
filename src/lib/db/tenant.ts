@@ -27,7 +27,11 @@ import { prisma as basePrisma } from "@/lib/db/prisma";
  * `Organization` NO va: es el modelo raíz, se filtra por su propio `id`.
  * `Profile` tampoco: lo maneja el flujo de auth con el cliente sin scopear.
  */
-const TENANT_SCOPED_MODELS: ReadonlySet<string> = new Set(["Project", "Plan"]);
+const TENANT_SCOPED_MODELS: ReadonlySet<string> = new Set([
+  "Project",
+  "Plan",
+  "Measurement",
+]);
 
 /** Operaciones que filtran filas existentes: les inyectamos el `where`. */
 const WHERE_OPERATIONS: ReadonlySet<string> = new Set([
@@ -222,6 +226,7 @@ type ScopedClient = ReturnType<typeof createScopedClient>;
 
 type ProjectDelegate = ScopedClient["project"];
 type PlanDelegate = ScopedClient["plan"];
+type MeasurementDelegate = ScopedClient["measurement"];
 
 /**
  * ────────────────────────────────────────────────────────────────────────────
@@ -336,9 +341,67 @@ interface TenantPlanDelegate
   ): Prisma.Prisma__PlanClient<Prisma.Result<PlanDelegate, T, "upsert">>;
 }
 
-export type TenantPrisma = Omit<ScopedClient, "project" | "plan"> & {
+/** Mismo bloque, copiado tal cual para Measurement. */
+
+type MeasurementCreateInput = Omit<
+  Prisma.MeasurementUncheckedCreateInput,
+  "organizationId"
+> & {
+  organizationId?: string;
+};
+
+type MeasurementCreateManyInput = Omit<
+  Prisma.MeasurementCreateManyInput,
+  "organizationId"
+> & {
+  organizationId?: string;
+};
+
+type MeasurementCreateArgs = Omit<Prisma.MeasurementCreateArgs, "data"> & {
+  data: MeasurementCreateInput;
+};
+
+type MeasurementCreateManyArgs = Omit<Prisma.MeasurementCreateManyArgs, "data"> & {
+  data: MeasurementCreateManyInput | MeasurementCreateManyInput[];
+};
+
+type MeasurementCreateManyAndReturnArgs = Omit<
+  Prisma.MeasurementCreateManyAndReturnArgs,
+  "data"
+> & {
+  data: MeasurementCreateManyInput | MeasurementCreateManyInput[];
+};
+
+type MeasurementUpsertArgs = Omit<Prisma.MeasurementUpsertArgs, "create"> & {
+  create: MeasurementCreateInput;
+};
+
+interface TenantMeasurementDelegate
+  extends Omit<
+    MeasurementDelegate,
+    "create" | "createMany" | "createManyAndReturn" | "upsert"
+  > {
+  create<T extends MeasurementCreateArgs>(
+    args: Prisma.SelectSubset<T, MeasurementCreateArgs>
+  ): Prisma.Prisma__MeasurementClient<Prisma.Result<MeasurementDelegate, T, "create">>;
+
+  createMany<T extends MeasurementCreateManyArgs>(
+    args: Prisma.SelectSubset<T, MeasurementCreateManyArgs>
+  ): Prisma.PrismaPromise<Prisma.BatchPayload>;
+
+  createManyAndReturn<T extends MeasurementCreateManyAndReturnArgs>(
+    args: Prisma.SelectSubset<T, MeasurementCreateManyAndReturnArgs>
+  ): Prisma.PrismaPromise<Prisma.Result<MeasurementDelegate, T, "createManyAndReturn">>;
+
+  upsert<T extends MeasurementUpsertArgs>(
+    args: Prisma.SelectSubset<T, MeasurementUpsertArgs>
+  ): Prisma.Prisma__MeasurementClient<Prisma.Result<MeasurementDelegate, T, "upsert">>;
+}
+
+export type TenantPrisma = Omit<ScopedClient, "project" | "plan" | "measurement"> & {
   project: TenantProjectDelegate;
   plan: TenantPlanDelegate;
+  measurement: TenantMeasurementDelegate;
 };
 
 /**

@@ -29,24 +29,43 @@ import { loadPdfjs } from "@/lib/pdf/pdfjs";
 
 export type PdfSource = { kind: "file"; file: File } | { kind: "plan"; planId: string };
 
-/** Puntos a dibujar sobre una página concreta, en user-space. */
-export type PdfOverlay = {
+/**
+ * Una figura a dibujar sobre una página, en user-space.
+ *
+ * `closed` cierra el contorno (áreas); `tone` distingue lo que se está
+ * dibujando ahora de lo que ya está guardado, para que el usuario vea de un
+ * vistazo qué es en firme y qué está en curso.
+ */
+export type PdfOverlayShape = {
+  id: string;
   /** 0-based, como se persiste. Si no coincide con la página a la vista, no se dibuja. */
   pageIndex: number;
   points: readonly Point[];
+  closed?: boolean;
+  tone?: "draft" | "saved";
+  label?: string;
 };
 
 type PdfViewerProps = {
   source: PdfSource;
   /** Con esto en true, cada click sobre la página emite un punto. */
   pickingPoints?: boolean;
-  overlay?: PdfOverlay | null;
+  overlays?: readonly PdfOverlayShape[];
   /**
    * Recibe el punto YA convertido a user-space, junto con la página donde se
    * marcó. El pageIndex viaja con cada punto para que el padre no tenga que
    * seguir en paralelo qué página está a la vista.
    */
   onPickPoint?: (point: Point, pageIndex: number) => void;
+  /** Doble click sobre la página: cierra la figura en curso. */
+  onFinishShape?: () => void;
+  /** La página cambió (0-based). El padre lo necesita para saber si puede medir. */
+  onPageChange?: (pageIndex: number) => void;
+};
+
+const TONE_COLOR: Readonly<Record<"draft" | "saved", string>> = {
+  draft: "#dc2626",
+  saved: "#2563eb",
 };
 
 const MIN_SCALE = 0.1;
@@ -101,8 +120,10 @@ function readPair(converted: unknown, context: string): Point {
 export function PdfViewer({
   source,
   pickingPoints = false,
-  overlay = null,
+  overlays = [],
   onPickPoint,
+  onFinishShape,
+  onPageChange,
 }: PdfViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -305,19 +326,29 @@ export function PdfViewer({
 
   const pageCount = pdf?.numPages ?? 0;
 
+  /** Navegación de páginas: el padre necesita saber en cuál está parado. */
+  function goToPage(next: number) {
+    const target = Math.min(Math.max(1, next), pageCount);
+
+    setPageNumber(target);
+    onPageChange?.(target - 1);
+  }
+
   // La vuelta del mismo viaje: los puntos guardados en user-space se proyectan
   // a píxeles CSS para dibujarlos. Por eso las marcas quedan pegadas al plano
   // al hacer zoom, en vez de flotar donde se clickeó.
-  const overlayPoints =
-    cssViewport && overlay && overlay.pageIndex === pageNumber - 1
-      ? projectPoints(overlay.points, cssViewport)
-      : [];
+  const visibleShapes = cssViewport
+    ? overlays
+        .filter((shape) => shape.pageIndex === pageNumber - 1 && shape.points.length > 0)
+        .map((shape) => ({ ...shape, projected: projectPoints(shape.points, cssViewport) }))
+        .filter((shape) => shape.projected.length > 0)
+    : [];
 
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-center gap-2">
         <ToolbarButton
-          onClick={() => setPageNumber((current) => Math.max(1, current - 1))}
+          onClick={() => goToPage(pageNumber - 1)}
           disabled={status !== "ready" || pageNumber <= 1}
         >
           ← Anterior
@@ -328,7 +359,7 @@ export function PdfViewer({
         </span>
 
         <ToolbarButton
-          onClick={() => setPageNumber((current) => Math.min(pageCount, current + 1))}
+          onClick={() => goToPage(pageNumber + 1)}
           disabled={status !== "ready" || pageNumber >= pageCount}
         >
           Siguiente →
@@ -369,38 +400,72 @@ export function PdfViewer({
           <canvas
             ref={canvasRef}
             onClick={handleCanvasClick}
+            onDoubleClick={() => onFinishShape?.()}
             className={`block bg-white ${pickingPoints ? "cursor-crosshair" : ""}`}
           />
 
-          {overlayPoints.length > 0 && cssViewport ? (
+          {visibleShapes.length > 0 && cssViewport ? (
             <svg
               // pointer-events-none: el SVG tapa el canvas, y sin esto se comería
-              // el segundo click de la calibración.
+              // los clicks de la herramienta que está dibujando abajo.
               className="pointer-events-none absolute left-0 top-0"
               width={cssViewport.width}
               height={cssViewport.height}
               aria-hidden
             >
-              {overlayPoints.length > 1 ? (
-                <polyline
-                  points={overlayPoints.map((point) => `${point.x},${point.y}`).join(" ")}
-                  fill="none"
-                  stroke="#dc2626"
-                  strokeWidth={2}
-                />
-              ) : null}
+              {visibleShapes.map((shape) => {
+                const color = TONE_COLOR[shape.tone ?? "saved"];
+                const path = shape.projected.map((point) => `${point.x},${point.y}`).join(" ");
+                const isDraft = shape.tone === "draft";
 
-              {overlayPoints.map((point, index) => (
-                <circle
-                  key={index}
-                  cx={point.x}
-                  cy={point.y}
-                  r={5}
-                  fill="#dc2626"
-                  stroke="white"
-                  strokeWidth={1.5}
-                />
-              ))}
+                return (
+                  <g key={shape.id}>
+                    {shape.projected.length > 1 ? (
+                      // Un polígono cerrado se dibuja como <polygon> para que el
+                      // contorno cierre solo, igual que lo cierra el shoelace.
+                      shape.closed ? (
+                        <polygon
+                          points={path}
+                          fill={color}
+                          fillOpacity={0.15}
+                          stroke={color}
+                          strokeWidth={2}
+                        />
+                      ) : (
+                        <polyline points={path} fill="none" stroke={color} strokeWidth={2} />
+                      )
+                    ) : null}
+
+                    {shape.projected.map((point, index) => (
+                      <circle
+                        key={index}
+                        cx={point.x}
+                        cy={point.y}
+                        // Los vértices en curso van más grandes: son los que el
+                        // usuario todavía puede estar por corregir.
+                        r={isDraft ? 5 : 3}
+                        fill={color}
+                        stroke="white"
+                        strokeWidth={1.5}
+                      />
+                    ))}
+
+                    {shape.label && shape.projected.length > 0 ? (
+                      <text
+                        x={shape.projected[0].x + 8}
+                        y={shape.projected[0].y - 8}
+                        fill={color}
+                        fontSize={12}
+                        stroke="white"
+                        strokeWidth={3}
+                        paintOrder="stroke"
+                      >
+                        {shape.label}
+                      </text>
+                    ) : null}
+                  </g>
+                );
+              })}
             </svg>
           ) : null}
         </div>

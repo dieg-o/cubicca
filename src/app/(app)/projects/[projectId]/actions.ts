@@ -10,10 +10,16 @@ import { distance, scaleFactorFromCalibration, toMeters } from "@/lib/geometry";
 import {
   CALIBRATION_VERSION,
   calibrationInputSchema,
+  parseStoredCalibration,
   type PlanCalibration,
 } from "@/lib/plans/calibration";
 import { PLAN_CONTENT_TYPE, PLAN_MAX_FILE_SIZE_BYTES } from "@/lib/plans/constants";
 import { diagnosePlan, diagnosisInputSchema } from "@/lib/plans/diagnosis";
+import {
+  computeMeasurementValue,
+  createMeasurementSchema,
+  VALUE_MISMATCH_EPSILON,
+} from "@/lib/plans/measurement";
 import { getSupabaseAdmin, PLANS_BUCKET } from "@/lib/supabase/admin";
 
 /**
@@ -354,5 +360,191 @@ export async function calibratePlan(
       ok: false,
       error: "No se pudo calibrar. Marcá dos puntos separados y revisá la medida.",
     };
+  }
+}
+
+/**
+ * ────────────────────────────────────────────────────────────────────────────
+ * Mediciones.
+ *
+ * Misma división que en la calibración: el cliente DIBUJA, el servidor CALCULA.
+ * Lo que llega son vértices en user-space, el tipo y (para un muro) el alto; el
+ * `computedValue` se recomputa acá con el motor y el `scaleFactor` del plano.
+ * El número que el usuario vio mientras dibujaba viaja solo para compararlo —
+ * si no coincide, es que las dos puntas no están corriendo la misma fórmula, y
+ * eso tiene que aparecer en el log y no en un presupuesto.
+ * ────────────────────────────────────────────────────────────────────────────
+ */
+
+export type CreateMeasurementResult =
+  | { ok: true; measurementId: string; computedValue: number }
+  | { ok: false; error: string };
+
+export type MeasurementMutationResult = { ok: true } | { ok: false; error: string };
+
+export async function createMeasurement(
+  planId: string,
+  measurement: unknown
+): Promise<CreateMeasurementResult> {
+  const profile = await requireProfile();
+
+  // El planId va por parámetro y el resto viene del cliente: se juntan acá para
+  // que Zod valide todo junto, y el planId del argumento siempre gana.
+  const parsed = createMeasurementSchema.safeParse(
+    typeof measurement === "object" && measurement !== null
+      ? { ...measurement, planId }
+      : { planId }
+  );
+
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: parsed.error.issues[0]?.message ?? "La medición no es válida.",
+    };
+  }
+
+  const { type, pageIndex, points, alto, label, previewValue } = parsed.data;
+
+  const db = getTenantPrisma(profile.organizationId);
+
+  const plan = await db.plan.findUnique({
+    where: { id: parsed.data.planId },
+    select: { id: true, scaleFactor: true, calibrationJson: true },
+  });
+
+  if (!plan) {
+    return { ok: false, error: "El plano no existe." };
+  }
+
+  // Medir sobre un plano sin calibrar daría un número en unidades de PDF
+  // disfrazado de metros. Es la precondición de todo el resto.
+  if (plan.scaleFactor === null) {
+    return { ok: false, error: "El plano no está calibrado." };
+  }
+
+  const calibration = parseStoredCalibration(plan.calibrationJson);
+
+  if (!calibration) {
+    console.error(`[measurements] plan ${plan.id} tiene scaleFactor sin calibración legible`);
+
+    return { ok: false, error: "La calibración del plano no se puede leer. Recalibralo." };
+  }
+
+  // Un scaleFactor derivado de la planta no dice NADA sobre un detalle dibujado
+  // en otra hoja a otra escala. Medir ahí daría un número creíble y mal.
+  if (pageIndex !== calibration.pageIndex) {
+    return {
+      ok: false,
+      error: `Este plano está calibrado sobre la página ${calibration.pageIndex + 1}. Medí ahí, o recalibrá sobre esta página.`,
+    };
+  }
+
+  try {
+    // LA cuenta. El `previewValue` del cliente no participa: solo se compara.
+    const computedValue = computeMeasurementValue(type, points, plan.scaleFactor, alto);
+
+    if (!Number.isFinite(computedValue) || computedValue <= 0) {
+      return { ok: false, error: "La medición no da un valor válido. Revisá los puntos." };
+    }
+
+    const drift = Math.abs(computedValue - previewValue) / computedValue;
+
+    if (drift > VALUE_MISMATCH_EPSILON) {
+      // No es un error del usuario y no le cambia nada: se guarda el valor del
+      // servidor igual. Pero que las dos puntas calculen distinto es un bug, y
+      // sin este log se descubriría recién cuando un presupuesto no cierre.
+      console.warn(
+        `[measurements] preview del cliente ≠ valor del servidor en el plano ${plan.id}: ` +
+          `cliente=${previewValue} servidor=${computedValue} (${(drift * 100).toFixed(6)} %)`
+      );
+    }
+
+    const created = await db.measurement.create({
+      data: {
+        planId: plan.id,
+        type,
+        pageIndex,
+        geometryJson: points,
+        computedValue,
+        alto,
+        label,
+      },
+      select: { id: true },
+    });
+
+    return { ok: true, measurementId: created.id, computedValue };
+  } catch (error) {
+    // Acá caen las guardas del motor (pocos puntos, alto <= 0) y la base.
+    console.error("[measurements] falló la creación de la medición:", error);
+
+    return { ok: false, error: "No se pudo guardar la medición. Probá de nuevo." };
+  }
+}
+
+export async function deleteMeasurement(
+  measurementId: string
+): Promise<MeasurementMutationResult> {
+  const profile = await requireProfile();
+
+  const parsed = z.uuid().safeParse(measurementId);
+
+  if (!parsed.success) {
+    return { ok: false, error: "Medición inválida." };
+  }
+
+  const db = getTenantPrisma(profile.organizationId);
+
+  try {
+    // El where scopeado hace que una medición de otra organización simplemente
+    // no exista: `deleteMany` borra 0 filas en vez de tirar.
+    const { count } = await db.measurement.deleteMany({ where: { id: parsed.data } });
+
+    if (count === 0) {
+      return { ok: false, error: "La medición no existe." };
+    }
+
+    return { ok: true };
+  } catch (error) {
+    console.error("[measurements] falló el borrado de la medición:", error);
+
+    return { ok: false, error: "No se pudo borrar la medición. Probá de nuevo." };
+  }
+}
+
+export async function updateMeasurementLabel(
+  measurementId: string,
+  label: string
+): Promise<MeasurementMutationResult> {
+  const profile = await requireProfile();
+
+  const parsed = z
+    .object({ id: z.uuid("Medición inválida."), label: z.string().trim().max(120) })
+    .safeParse({ id: measurementId, label });
+
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: parsed.error.issues[0]?.message ?? "La etiqueta no es válida.",
+    };
+  }
+
+  const db = getTenantPrisma(profile.organizationId);
+
+  try {
+    const { count } = await db.measurement.updateMany({
+      where: { id: parsed.data.id },
+      // Vaciar el campo borra la etiqueta en vez de guardar un string vacío.
+      data: { label: parsed.data.label.length > 0 ? parsed.data.label : null },
+    });
+
+    if (count === 0) {
+      return { ok: false, error: "La medición no existe." };
+    }
+
+    return { ok: true };
+  } catch (error) {
+    console.error("[measurements] falló el renombrado de la medición:", error);
+
+    return { ok: false, error: "No se pudo renombrar la medición. Probá de nuevo." };
   }
 }

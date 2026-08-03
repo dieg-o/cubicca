@@ -20,8 +20,12 @@ dashboard). `signUp()` devuelve sesión directa y el alta va derecho a
 viewer con pdf.js y diagnóstico vector/raster persistido.
 **TD-004 -> HECHO**: calibración de escala por plano (el usuario marca una cota
 conocida) + motor geométrico puro y testeado en `src/lib/geometry/`.
-**Próximo: TD-005** (herramientas de medición: largo / muro / área con
-persistencia).
+**TD-005 -> CÓDIGO COMPLETO, FALTA EL E2E**: las tres herramientas de medición
+(largo / muro / área) con persistencia, borrado y etiquetas. Verde en unitarios
+(48) y en aislamiento (51); falta la corrida contra el plano real, que es lo
+único que valida la cadena entera.
+**Próximo: TD-006** (catálogo de partidas: agrupar mediciones y totalizar por
+rubro en vez de por tipo de herramienta).
 
 ## TD-001 — Bootstrap CORE
 
@@ -669,3 +673,160 @@ dónde agarrarse.
   El residuo es cuantización del click (el puntero cae en un píxel entero), no
   del modelo: la conversión a user-space es exacta. Se achica marcando cotas
   largas, que es lo que conviene hacer igual.
+
+## TD-005 — Herramientas de medición
+
+La primera vez que la app produce un número que sirve para presupuestar. TD-004
+dejó el plano sabiendo cuánto mide cada unidad de su user-space; acá se usa eso
+para medir de verdad, con tres herramientas y una tabla donde persistirlas.
+
+| Herramienta | Figura | Fórmula | Devuelve |
+| --- | --- | --- | --- |
+| `LARGO_CONTINUO` | polilínea abierta | `largo_pdf × scaleFactor` | metros |
+| `MURO` | polilínea abierta + alto | `largo_pdf × scaleFactor × alto` | m² |
+| `AREA` | polígono cerrado | `área_pdf × scaleFactor²` | m² |
+
+El muro no es una herramienta aparte del largo: es el mismo recorrido con una
+altura. Se separa porque lo que se cubica es la superficie, y tenerlo como tipo
+propio evita que el usuario tenga que acordarse de multiplicar.
+
+### El contrato: el cliente dibuja, el servidor calcula
+
+| Paso | Dónde | Qué pasa |
+| --- | --- | --- |
+| Marcar | Browser | Clicks sobre la página, cada uno convertido a user-space con `convertToPdfPoint()` |
+| Previsualizar | Browser | `computeMeasurementValue()` sobre los puntos marcados, en vivo |
+| Cerrar | Browser | Enter, doble click o "Cerrar figura" |
+| Guardar | `createMeasurement` (server action) | Zod valida, **el servidor recalcula** y persiste su propio número |
+
+Es la misma decisión que en la calibración de TD-004 y en el diagnóstico
+vector/raster de TD-003: **el número que se persiste nunca viene del cliente.**
+Un server action es un POST alcanzable sin pasar por la UI, y si el valor
+llegara ya calculado, un POST a mano podría declarar 500 m² de contrapiso sobre
+una geometría de 3 m².
+
+Lo que sí viaja es el `previewValue`, y **solo para compararlo**. La fórmula
+vive una vez sola en `src/lib/plans/measurement.ts` y la importan las dos
+puntas, así que preview y valor guardado no pueden divergir por descuido. Si
+divergen igual —código viejo en el bundle del browser, una fórmula tocada de un
+solo lado— es un bug, y el server lo loguea con los dos números en vez de
+dejarlo pasar. El umbral es `VALUE_MISMATCH_EPSILON` (1e-9): ruido de punto
+flotante entre dos máquinas haciendo la misma cuenta, nada más. Se guarda igual
+el valor del servidor: no es un error del usuario y no le cambia nada.
+
+Ese módulo lo importan client components, así que no lleva `server-only`.
+
+### Se guardan los PUNTOS, no solo el número
+
+`geometryJson` persiste los vértices en user-space. Guardar únicamente el
+`computedValue` sería más barato y dejaría el sistema sin salida: **si mañana se
+corrige la calibración del plano, con los puntos se recalcula todo y sin ellos
+hay que remarcar cada medición a mano.** Es la misma lógica que hace que
+`calibrationJson` guarde el cómo y no solo el cuánto.
+
+De ahí salen dos cosas más: el overlay puede redibujar lo guardado sobre el
+plano, y el techo de 500 vértices del schema —que no es por la cuenta, el
+shoelace no se despeina, sino porque ese JSON viaja en cada carga de la página y
+una polilínea de 50.000 puntos es un bug de la UI, no un contorno de obra.
+
+### Dos precondiciones duras para medir
+
+1. **El plano tiene que estar calibrado.** Sin `scaleFactor` no hay metros: hay
+   unidades de PDF disfrazadas de metros. La UI ni siquiera ofrece las
+   herramientas, ofrece calibrar.
+2. **Hay que estar parado en la página calibrada.** Un factor derivado de la
+   planta no dice *nada* sobre un detalle dibujado en otra hoja a otra escala.
+   Medir ahí no falla: da un número creíble y equivocado, que es peor.
+
+Las dos se chequean en el cliente (para no dejar dibujar al pedo) **y de nuevo
+en el server action**, que es donde valen. La segunda compara el `pageIndex` de
+la medición contra el `pageIndex` que quedó guardado en `calibrationJson`. Es la
+mitigación del límite conocido de TD-004 —una escala por plano—: no lo resuelve,
+pero impide que se convierta en un número mal calculado.
+
+### El estado del dibujo: una sola herramienta a la vez
+
+Calibrar y medir comparten el mismo mecanismo de captura de clicks, así que en
+`plans-panel.tsx` comparten **una sola** variable de estado (`Draft`, una unión
+discriminada por `kind`). Dos estados separados permitirían tener las dos
+herramientas activas peleándose los clicks; con uno, ese estado imposible no se
+puede representar.
+
+Detalles que salieron de usarlo:
+
+- **La polilínea suma vértices; la calibración topea en dos y el tercero
+  reinicia.** No es una inconsistencia: una cota tiene exactamente dos extremos,
+  y un tercer click ahí siempre es "me equivoqué", nunca "quiero un vértice más".
+- **`finished` congela la figura.** Una vez cerrada (Enter o doble click), los
+  clicks sobre el plano no agregan nada: el usuario está completando el
+  formulario, no dibujando.
+- **El doble click que cierra dispara dos `click` en el mismo píxel**, y el
+  segundo entraría como vértice duplicado. Se descarta comparando contra el
+  último punto (`DUPLICATE_POINT_EPSILON`).
+- **Los atajos van en `window`, no en el canvas**, porque el canvas no tiene
+  foco: el usuario viene de clickearlo, no de tabular hasta él. Con la guarda de
+  no robarle el Enter a los `input` del alto y la etiqueta.
+- **El área se dibuja cerrada recién cuando el usuario la cerró.** Mostrar el
+  lado de cierre antes sería dibujarle un tramo que todavía no marcó.
+- **Rojo lo que está en curso, azul lo guardado** (`tone` en el overlay), con
+  los vértices del borrador más grandes: son los que todavía puede corregir.
+
+El preview de un muro usa el `escantillonDefault` del proyecto (2,40 m) como
+valor inicial del input, que es lo que se tipea el 90% de las veces.
+
+### Aislamiento
+
+`Measurement` entra en `TENANT_SCOPED_MODELS` y tiene su bloque de tipos en
+`tenant.ts` —igual que `Project` y `Plan`— para que `create` no acepte un
+`organizationId` ajeno ni siquiera en tiempo de compilación.
+
+Dos decisiones que no son obvias:
+
+- **Las mediciones se leen en su propia consulta**, no como relación anidada del
+  proyecto. Colgarlas de `plans` funcionaría (el plano ya se probó propio), pero
+  dejaría una lectura que no pasa por la primitiva, y esa excepción es justo la
+  que después nadie recuerda.
+- **Hay un hueco que la primitiva no puede tapar y lo tapa el server action.**
+  Crear una medición con el `organizationId` propio pero el `planId` de otra
+  org: la fila entraría legítimamente en el tenant apuntando a un plano ajeno, y
+  la FK no lo impide porque es un uuid válido. Por eso `createMeasurement` carga
+  el plano con `getTenantPrisma` **antes** de escribir: si no es de la org, el
+  plano "no existe". El test de aislamiento documenta el hueco explícitamente
+  para que no se pierda.
+
+### Límites conocidos
+
+- **No se editan vértices.** Corregir una medición es borrarla y remarcarla.
+  Remarcar cuesta segundos; editar geometría cuesta un módulo entero.
+- **Los totales se agrupan por tipo de herramienta**, porque sumar metros con
+  metros cuadrados no significa nada. Agrupar por partida —que es lo que un
+  presupuesto necesita— es **TD-006**; el campo `label` de hoy es texto libre y
+  queda como el precursor de esa relación.
+- **Una escala por plano**, heredado de TD-004. Acotado por el chequeo de página
+  descrito arriba.
+
+### Verificación
+
+- `npm test`: **48 casos en verde** — los 20 del motor más 28 nuevos de
+  `measurement.test.ts`. Los que más valen: que el área lleve el factor al
+  cuadrado (se afirma que da 1 m² **y que no da 20**, el resultado de aplicarlo
+  una sola vez, lo bastante creíble como para colarse en un presupuesto); que un
+  muro sea exactamente el largo por el alto; que un alto ausente o cero sea un
+  error controlado y no un `NaN` persistido; y la contraprueba del epsilon —que
+  el umbral sea lo bastante chico como para delatar una fórmula distinta.
+- `npm run db:test-isolation`: **51 casos en verde**, 12 nuevos de
+  `Measurement`. Entre ellos el filtro que invita a saltearse la org en esta
+  feature (`findMany({ where: { planId } })` de otro tenant) y el hueco de la FK
+  descrito arriba.
+- **Falta el E2E contra el plano real** (`FUNDACIONES.pdf`), que es lo único que
+  prueba la cadena completa: marcar sobre el plano calibrado, verificar el valor
+  contra una cota conocida y confirmar que lo guardado se redibuja donde se
+  marcó. Hasta que eso corra, TD-005 no está cerrado.
+
+### Nota de infra: `vitest.config.mts`
+
+El test del motor usaba imports relativos, así que el alias `@/` nunca se había
+ejercitado bajo vitest. `measurement.ts` importa `@/lib/geometry`, y sin config
+vitest no lo resuelve aunque `tsc` esté conforme. La config replica el único
+alias del proyecto. Va en `.mts` porque como `.ts` Vite avisa que la carga como
+CommonJS, y eso se rompe en una major futura.

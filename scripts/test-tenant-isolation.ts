@@ -381,6 +381,145 @@ async function main(): Promise<void> {
       `quedó ${JSON.stringify(planSobrevivienteB)}`
     );
 
+    console.log("\nMediciones (colgadas de un plano, que cuelga de un proyecto)");
+
+    // Los planos de A se borraron arriba: se rehacen los dos lados del cruce.
+    const planoA = await raw.plan.create({
+      data: { ...planFields, organizationId: orgA.id, projectId: proyectoA.id },
+    });
+
+    const geometria = [
+      { x: 0, y: 0 },
+      { x: 10, y: 0 },
+    ];
+
+    const medicionA = await raw.measurement.create({
+      data: {
+        organizationId: orgA.id,
+        planId: planoA.id,
+        type: "LARGO_CONTINUO",
+        pageIndex: 0,
+        geometryJson: geometria,
+        computedValue: 5,
+      },
+    });
+    const medicionB = await raw.measurement.create({
+      data: {
+        organizationId: orgB.id,
+        planId: planB.id,
+        type: "AREA",
+        pageIndex: 0,
+        geometryJson: geometria,
+        computedValue: 99,
+        label: "medición de B",
+      },
+    });
+
+    const medicionesVisibles = await db.measurement.findMany();
+    check(
+      "measurement.findMany() sin where devuelve solo las de la propia org",
+      medicionesVisibles.length === 1 && medicionesVisibles[0]?.id === medicionA.id,
+      `devolvió ${medicionesVisibles.length} fila(s)`
+    );
+
+    const medicionAjena = await db.measurement.findUnique({ where: { id: medicionB.id } });
+    check(
+      "measurement.findUnique() por id de otra org devuelve null",
+      medicionAjena === null,
+      `devolvió ${JSON.stringify(medicionAjena)}`
+    );
+
+    // El where olvidado de esta feature: el detalle de un plano lista sus
+    // mediciones por planId, y ese es el filtro que invita a saltearse la org.
+    const porPlanoAjeno = await db.measurement.findMany({ where: { planId: planB.id } });
+    check(
+      "measurement.findMany() por el planId de otra org no devuelve nada",
+      porPlanoAjeno.length === 0,
+      `devolvió ${porPlanoAjeno.length} fila(s)`
+    );
+
+    const medicionCreada = await db.measurement.create({
+      data: {
+        planId: planoA.id,
+        type: "MURO",
+        pageIndex: 0,
+        geometryJson: geometria,
+        computedValue: 12,
+        alto: 2.4,
+      },
+    });
+    check(
+      "measurement.create() sin organizationId lo inyecta desde la sesión",
+      medicionCreada.organizationId === orgA.id,
+      `quedó en ${medicionCreada.organizationId}`
+    );
+
+    await checkThrows("measurement.create() con el organizationId de otra org lanza error", () =>
+      db.measurement.create({
+        data: {
+          planId: planoA.id,
+          organizationId: orgB.id,
+          type: "AREA",
+          pageIndex: 0,
+          geometryJson: geometria,
+          computedValue: 1,
+        },
+      })
+    );
+
+    // Medir sobre un plano ajeno declarando la org propia: la fila entraría en
+    // el tenant de A apuntando a un plano de B. La FK no lo impide —es un uuid
+    // válido— así que lo tiene que atajar el server action verificando el plano
+    // por getTenantPrisma antes de escribir. Se documenta acá el hueco real.
+    const planoAjenoDesdeA = await db.plan.findUnique({ where: { id: planB.id } });
+    check(
+      "el plano de otra org no se puede cargar para medir sobre él",
+      planoAjenoDesdeA === null,
+      `devolvió ${JSON.stringify(planoAjenoDesdeA)}`
+    );
+
+    await checkThrows(
+      "measurement.findMany() con un organizationId ajeno en el where lanza error",
+      () => db.measurement.findMany({ where: { organizationId: orgB.id } })
+    );
+
+    await checkThrows("measurement.update() por id de otra org no encuentra la fila", () =>
+      db.measurement.update({ where: { id: medicionB.id }, data: { label: "pisada por A" } })
+    );
+
+    const renombradas = await db.measurement.updateMany({
+      where: { id: medicionB.id },
+      data: { label: "pisada por A" },
+    });
+    check(
+      "updateMany() sobre el id de una medición ajena no toca nada",
+      renombradas.count === 0,
+      `actualizó ${renombradas.count} fila(s)`
+    );
+
+    const borradasAjenas = await db.measurement.deleteMany({ where: { id: medicionB.id } });
+    check(
+      "deleteMany() sobre el id de una medición ajena no borra nada",
+      borradasAjenas.count === 0,
+      `borró ${borradasAjenas.count} fila(s)`
+    );
+
+    const medicionesBorradas = await db.measurement.deleteMany();
+    check(
+      "measurement.deleteMany() sin where borra solo las de la propia org",
+      medicionesBorradas.count === 2,
+      `borró ${medicionesBorradas.count} fila(s)`
+    );
+
+    const medicionSobreviviente = await raw.measurement.findUnique({
+      where: { id: medicionB.id },
+    });
+    check(
+      "la medición de la otra org sigue intacta y sin renombrar",
+      medicionSobreviviente !== null && medicionSobreviviente.label === "medición de B",
+      `quedó ${JSON.stringify(medicionSobreviviente)}`
+    );
+
     console.log("\nContrato de la primitiva");
 
     await checkThrows("getTenantPrisma('') lanza error", async () => getTenantPrisma(""));

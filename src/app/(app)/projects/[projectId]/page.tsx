@@ -5,7 +5,7 @@ import { z } from "zod";
 import { PlansPanel } from "@/app/(app)/projects/[projectId]/plans-panel";
 import { requireProfile } from "@/lib/auth/session";
 import { getTenantPrisma } from "@/lib/db/tenant";
-import { toPlanSummary } from "@/lib/plans/view";
+import { toMeasurementSummary, toPlanSummary } from "@/lib/plans/view";
 
 const projectIdSchema = z.uuid();
 
@@ -53,6 +53,27 @@ export default async function ProjectPage({ params }: PageProps<"/projects/[proj
     notFound();
   }
 
+  // Las mediciones van en su propia consulta, no como relación anidada del
+  // proyecto: así también ellas pasan por la primitiva y se les inyecta el
+  // `organizationId`. Leerlas colgando de `plans` funcionaría —el plano ya está
+  // probado como propio— pero dejaría una lectura sin scopear por sí misma, y
+  // esa excepción es justo la que después nadie recuerda.
+  const measurements = await db.measurement.findMany({
+    where: { planId: { in: project.plans.map((plan) => plan.id) } },
+    orderBy: { createdAt: "asc" },
+    select: {
+      id: true,
+      planId: true,
+      type: true,
+      pageIndex: true,
+      geometryJson: true,
+      computedValue: true,
+      alto: true,
+      label: true,
+      createdAt: true,
+    },
+  });
+
   return (
     <div className="flex flex-1 flex-col gap-6 px-6 py-10">
       <div className="space-y-2">
@@ -67,7 +88,12 @@ export default async function ProjectPage({ params }: PageProps<"/projects/[proj
         </p>
       </div>
 
-      <PlansPanel projectId={project.id} plans={project.plans.map(toPlanSummary)} />
+      <PlansPanel
+        projectId={project.id}
+        escantillonDefault={project.escantillonDefault}
+        plans={project.plans.map(toPlanSummary)}
+        measurements={measurements.map(toMeasurementSummary)}
+      />
     </div>
   );
 }

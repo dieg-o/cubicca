@@ -1,5 +1,7 @@
+import type { Point } from "@/lib/geometry";
 import { parseStoredCalibration, type PlanCalibration } from "@/lib/plans/calibration";
 import { parseStoredDiagnosis, type PlanDiagnosis } from "@/lib/plans/diagnosis";
+import { parseStoredGeometry, type MeasurementType } from "@/lib/plans/measurement";
 
 /**
  * El plano tal como lo ve la UI.
@@ -36,6 +38,48 @@ type PlanRow = {
   scaleFactor: number | null;
   calibrationJson: unknown;
 };
+
+/** Una medición tal como la ve la UI. */
+export type MeasurementSummary = {
+  id: string;
+  planId: string;
+  type: MeasurementType;
+  pageIndex: number;
+  /** Los vértices en user-space. `null` si el JSON guardado no valida. */
+  points: Point[] | null;
+  computedValue: number;
+  alto: number | null;
+  label: string | null;
+  createdAt: string;
+};
+
+type MeasurementRow = {
+  id: string;
+  planId: string;
+  type: MeasurementType;
+  pageIndex: number;
+  geometryJson: unknown;
+  computedValue: number;
+  alto: number | null;
+  label: string | null;
+  createdAt: Date;
+};
+
+export function toMeasurementSummary(measurement: MeasurementRow): MeasurementSummary {
+  return {
+    id: measurement.id,
+    planId: measurement.planId,
+    type: measurement.type,
+    pageIndex: measurement.pageIndex,
+    // Si la geometría guardada no valida, la medición se sigue listando con su
+    // valor: lo único que se pierde es poder redibujarla sobre el plano.
+    points: parseStoredGeometry(measurement.geometryJson),
+    computedValue: measurement.computedValue,
+    alto: measurement.alto,
+    label: measurement.label,
+    createdAt: measurement.createdAt.toISOString(),
+  };
+}
 
 export function toPlanSummary(plan: PlanRow): PlanSummary {
   return {
